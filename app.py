@@ -12,6 +12,11 @@ import time
 import cpuinfo
 import gc
 import os
+import requests
+from PIL import Image
+from io import BytesIO
+import openvino as ov
+import threading
 
 # Set CPU affinity for optimization
 os.environ["GOMP_CPU_AFFINITY"] = "0-7"  # Use first 8 CPU cores
@@ -29,6 +34,7 @@ MAX_TOKENS_LIMIT = 1000
 start_time = time.time()
 snapshot_download(repo_id="OpenVINO/mistral-7b-instruct-v0.1-int8-ov", local_dir="mistral-ov")
 snapshot_download(repo_id="OpenVINO/whisper-tiny-fp16-ov", local_dir="whisper-ov-model")
+snapshot_download(repo_id="OpenVINO/InternVL2-1B-int8-ov", local_dir="internvl-ov")  # Added for image analysis
 print(f"Model download time: {time.time() - start_time:.2f} seconds")
 
 # CPU-specific configuration
@@ -44,7 +50,7 @@ elif 'avx2' in cpu_features:
 # Initialize models with performance flags
 start_time = time.time()
 mistral_pipe = openvino_genai.LLMPipeline(
-    "mistral-ov", 
+    "mistral-ov",
     device="CPU",
     config={
         "PERFORMANCE_HINT": "THROUGHPUT",
@@ -53,11 +59,25 @@ mistral_pipe = openvino_genai.LLMPipeline(
 )
 
 whisper_pipe = openvino_genai.WhisperPipeline(
-    "whisper-ov-model", 
+    "whisper-ov-model",
     device="CPU"
 )
 pipe_lock = Lock()
 print(f"Model initialization time: {time.time() - start_time:.2f} seconds")
+
+# Initialize InternVL pipeline for image analysis (lazy loading)
+internvl_pipe = None
+internvl_lock = Lock()
+
+def get_internvl_pipeline():
+    global internvl_pipe
+    with internvl_lock:
+        if internvl_pipe is None:
+            print("Initializing InternVL pipeline...")
+            start_time = time.time()
+            internvl_pipe = openvino_genai.VLMPipeline("internvl-ov", device="CPU")
+            print(f"InternVL pipeline initialization time: {time.time() - start_time:.2f} seconds")
+    return internvl_pipe
 
 # Warm up models
 print("Warming up models...")
@@ -74,7 +94,7 @@ image_executor = ThreadPoolExecutor(max_workers=8)
 def fetch_images(query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
     """Fetch unique images by requesting different result pages"""
     start_time = time.time()
-    
+
     if num <= 0:
         return []
 
@@ -82,12 +102,12 @@ def fetch_images(query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
         service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
         image_links = []
         seen_urls = set()  # To track unique URLs
-        
+
         # Start from different positions to get unique images
         for start_index in range(1, num * 2, 2):  # Step by 2 to get different pages
             if len(image_links) >= num:
                 break
-                
+
             res = service.cse().list(
                 q=query,
                 cx=GOOGLE_CSE_ID,
@@ -95,14 +115,14 @@ def fetch_images(query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
                 num=1,  # Get one result per request
                 start=start_index  # Start at different positions
             ).execute()
-            
+
             if "items" in res and res["items"]:
                 item = res["items"][0]
                 # Skip duplicates
                 if item["link"] not in seen_urls:
                     image_links.append(item["link"])
                     seen_urls.add(item["link"])
-        
+
         print(f"Unique image fetch time: {time.time() - start_time:.2f} seconds")
         return image_links[:num]  # Return only the requested number
     except Exception as e:
@@ -176,27 +196,27 @@ def stream_answer(message: str, max_tokens: int, include_images: bool) -> str:
     accumulated = []
     token_count = 0
     last_gc = time.time()
-    
+
     while not completion_event.is_set() or not response_queue.empty():
         if error[0]:
             yield f"Error: {error[0]}"
             print(f"Stream answer time: {time.time() - start_time:.2f} seconds")
             return
-            
+
         try:
             token_batch = response_queue.get_nowait()
             accumulated.append(token_batch)
             token_count += len(token_batch)
-            
+
             # Periodic garbage collection
             if time.time() - last_gc > 2.0:  # Every 2 seconds
                 gc.collect()
                 last_gc = time.time()
-            
+
             yield "".join(accumulated)
         except Empty:
             continue
-            
+
     print(f"Generated {token_count} tokens in {time.time() - start_time:.2f} seconds "
           f"({token_count/(time.time() - start_time):.2f} tokens/sec)")
     yield "".join(accumulated)
@@ -204,12 +224,12 @@ def stream_answer(message: str, max_tokens: int, include_images: bool) -> str:
 def run_chat(message: str, history: list, include_images: bool, max_tokens: int, num_images: int):
     start_time = time.time()
     final_text = ""
-    
+
     # Create a placeholder for the streaming response
     history.append((message, "", []))
     rendered_history = render_history(history)
     yield rendered_history, gr.update(value="", interactive=False)
-    
+
     # Stream tokens and update chatbot in real-time
     for output in stream_answer(message, max_tokens, include_images):
         final_text = output
@@ -217,16 +237,16 @@ def run_chat(message: str, history: list, include_images: bool, max_tokens: int,
         updated_history = history[:-1] + [(message, final_text, [])]
         rendered_history = render_history(updated_history)
         yield rendered_history, gr.update(value="", interactive=False)
-    
+
     images = []
     if include_images:
         images = fetch_images(message, num_images)
-    
+
     # Update history with final response and images
     history[-1] = (message, final_text, images)
     if len(history) > MAX_HISTORY_TURNS:
         history = history[-MAX_HISTORY_TURNS:]
-    
+
     rendered_history = render_history(history)
     print(f"Total chat time: {time.time() - start_time:.2f} seconds")
     yield rendered_history, gr.update(value="", interactive=True)
@@ -243,10 +263,57 @@ def render_history(history):
             )
             text += f"<br><br><b>📸 Related Visuals:</b><br><div style='display: flex; flex-wrap: wrap;'>{images_html}</div>"
         rendered.append((user_msg, text))
-  
+
     return rendered
 
-with gr.Blocks(css="""
+# ===== IMAGE ANALYSIS FUNCTIONS =====
+def load_image(image_source):
+    """Load image from various sources: file path, URL, or PIL Image"""
+    if isinstance(image_source, str):
+        if image_source.startswith(("http://", "https://")):
+            # Load from URL
+            response = requests.get(image_source)
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+        else:
+            # Load from file path
+            image = Image.open(image_source).convert("RGB")
+    elif isinstance(image_source, Image.Image):
+        # Already a PIL image
+        image = image_source
+    else:
+        raise ValueError("Unsupported image input type")
+
+    # Convert to OpenVINO tensor
+    image_data = np.array(image.getdata()).reshape(1, image.size[1], image.size[0], 3).astype(np.byte)
+    return ov.Tensor(image_data)
+
+def analyze_image(image, url, prompt):
+    try:
+        # Determine image source (priority: uploaded image > URL)
+        image_source = image if image is not None else url
+
+        if not image_source:
+            return "⚠️ Please upload an image or enter an image URL"
+
+        # Convert to OpenVINO tensor
+        image_tensor = load_image(image_source)
+
+        # Get pipeline (lazy initialization)
+        pipe = get_internvl_pipeline()
+
+        # Generate response with thread safety
+        with internvl_lock:
+            pipe.start_chat()
+            output = pipe.generate(prompt, image=image_tensor, max_new_tokens=100)
+            pipe.finish_chat()
+
+        return output
+
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
+# ===== GRADIO INTERFACE =====
+css = """
     .processing {
         animation: pulse 1.5s infinite;
         color: #4a5568;
@@ -354,15 +421,32 @@ with gr.Blocks(css="""
         0%, 60%, 100% { transform: translateY(0); }
         30% { transform: translateY(-5px); }
     }
-""") as demo:
+    .tab-container {
+        border-radius: 12px;
+        padding: 20px;
+        background:#3fc9f8;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        margin-bottom: 20px;
+    }
+    .tab-header {
+        font-size: 24px;
+        margin-bottom: 20px;
+        padding-bottom: 10px;
+        border-bottom: 2px solid #e5e7eb;
+    }
+"""
+
+with gr.Blocks(css=css, title="EDU Chat by Phanindra Reddy K") as demo:
     gr.Markdown("# 🤖 EDU CHAT BY PHANINDRA REDDY K")
-    
+
     # System info banner
     gr.HTML("""
     <div class="system-info">
-        <strong>Performance Optimized for High-RAM Systems</strong>
+        <strong>Multi-Modal AI Assistant</strong>
         <ul>
-            <li>Adaptive resource allocation based on request type</li>
+            <li>Text & Voice Chat with Mistral-7B</li>
+            <li>Image Understanding with InternVL</li>
+            <li>Optimized for High-RAM Systems</li>
         </ul>
     </div>
     """)
@@ -382,116 +466,173 @@ with gr.Blocks(css="""
     """
     gr.HTML(modal_html)
 
-    state = gr.State([])
+    # Create tabs for different functionalities
+    with gr.Tabs():
+        # ===== MAIN CHAT TAB =====
+        with gr.Tab("💬 Chat Assistant", id="chat_tab"):
+            state = gr.State([])
 
-    with gr.Column(scale=2, elem_classes="chat-container"):
-        chatbot = gr.Chatbot(label="Conversation", height=500, bubble_full_width=False)
+            with gr.Column(scale=2, elem_classes="chat-container"):
+                chatbot = gr.Chatbot(label="Conversation", height=500, bubble_full_width=False)
 
-    with gr.Column(scale=1):
-        gr.Markdown("### 💬 Ask Your Question")
+            with gr.Column(scale=1):
+                gr.Markdown("### 💬 Ask Your Question")
 
-        with gr.Row():
-            user_input = gr.Textbox(
-                placeholder="Type your question here...",
-                label="",
-                container=False,
-                elem_id="question-input"
+                with gr.Row():
+                    user_input = gr.Textbox(
+                        placeholder="Type your question here...",
+                        label="",
+                        container=False,
+                        elem_id="question-input"
+                    )
+                    include_images = gr.Checkbox(
+                        label="Include Visuals",
+                        value=True,
+                        container=False,
+                        elem_id="image-checkbox"
+                    )
+
+                # Add the sliders container
+                with gr.Column(elem_classes="slider-container"):
+                    gr.Markdown("### ⚙️ Generation Settings")
+
+                    with gr.Row():
+                        max_tokens = gr.Slider(
+                            minimum=10,
+                            maximum=MAX_TOKENS_LIMIT,  # Increased to 1000
+                            value=DEFAULT_MAX_TOKENS,
+                            step=10,
+                            label="Response Length (Tokens)",
+                            info=f"Max: {MAX_TOKENS_LIMIT} tokens (for detailed explanations)",
+                            elem_classes="slider-label"
+                        )
+
+                    # Conditionally visible image slider row
+                    with gr.Row(visible=True) as image_slider_row:
+                        num_images = gr.Slider(
+                            minimum=0,
+                            maximum=5,
+                            value=DEFAULT_NUM_IMAGES,
+                            step=1,
+                            label="Number of Images",
+                            info="Set to 0 to disable images",
+                            elem_classes="slider-label"
+                        )
+
+                with gr.Row():
+                    submit_btn = gr.Button("Send Text", variant="primary")
+                    mic_btn = gr.Button("Transcribe Voice", variant="secondary")
+                    mic = gr.Audio(
+                        sources=["microphone"],
+                        type="numpy",
+                        label="Voice Input",
+                        show_label=False,
+                        elem_id="voice-input"
+                    )
+
+                processing = gr.HTML("""
+                    <div id="processing" style="display: none;">
+                        <div class="processing">🔮 Processing your request...</div>
+                    </div>
+                """)
+
+            # Toggle image slider visibility based on checkbox
+            def toggle_image_slider(include_visuals):
+                return gr.update(visible=include_visuals)
+
+            include_images.change(
+                fn=toggle_image_slider,
+                inputs=include_images,
+                outputs=image_slider_row
             )
-            include_images = gr.Checkbox(
-                label="Include Visuals",
-                value=True,
-                container=False,
-                elem_id="image-checkbox"
+
+            def toggle_processing():
+                return gr.update(visible=True), gr.update(interactive=False)
+
+            def hide_processing():
+                return gr.update(visible=False), gr.update(interactive=True)
+
+            # Update the submit_btn click handler to include streaming
+            submit_btn.click(
+                fn=toggle_processing,
+                outputs=[processing, submit_btn]
+            ).then(
+                fn=lambda: (gr.update(visible=True), gr.update(interactive=False)),
+                outputs=[processing, submit_btn]
+            ).then(
+                fn=run_chat,
+                inputs=[user_input, state, include_images, max_tokens, num_images],
+                outputs=[chatbot, user_input]
+            ).then(
+                fn=lambda: (gr.update(visible=False), gr.update(interactive=True)),
+                outputs=[processing, submit_btn]
             )
 
-        # Add the sliders container
-        with gr.Column(elem_classes="slider-container"):
-            gr.Markdown("### ⚙️ Generation Settings")
+            # Voice transcription
+            mic_btn.click(
+                fn=toggle_processing,
+                outputs=[processing, mic_btn]
+            ).then(
+                fn=transcribe,
+                inputs=mic,
+                outputs=user_input
+            ).then(
+                fn=hide_processing,
+                outputs=[processing, mic_btn]
+            )
 
-            with gr.Row():
-                max_tokens = gr.Slider(
-                    minimum=10,
-                    maximum=MAX_TOKENS_LIMIT,  # Increased to 1000
-                    value=DEFAULT_MAX_TOKENS,
-                    step=10,
-                    label="Response Length (Tokens)",
-                    info=f"Max: {MAX_TOKENS_LIMIT} tokens (for detailed explanations)",
-                    elem_classes="slider-label"
+        # ===== IMAGE ANALYSIS TAB =====
+        with gr.Tab("🖼️ Image Analysis", id="image_tab"):
+            with gr.Column(elem_classes="tab-container"):
+                gr.Markdown("## 🖼️ Image Understanding with InternVL")
+                gr.Markdown("Upload an image or enter a URL, then ask questions about it")
+
+                with gr.Row():
+                    with gr.Column():
+                        # Image upload
+                        image_upload = gr.Image(type="pil", label="Upload Image")
+
+                        # URL input
+                        url_input = gr.Textbox(
+                            label="OR Enter Image URL",
+                            placeholder="https://example.com/image.jpg",
+                            info="Enter a direct image URL"
+                        )
+
+                        # Preview image
+                        preview = gr.Image(label="Preview", interactive=False)
+
+                        # Update preview when inputs change
+                        def update_preview(img, url):
+                            if img is not None:
+                                return img
+                            elif url and url.startswith(("http://", "https://")):
+                                return url
+                            return None
+
+                        image_upload.change(update_preview, [image_upload, url_input], preview)
+                        url_input.change(update_preview, [image_upload, url_input], preview)
+
+                    with gr.Column():
+                        # Question input
+                        prompt = gr.Textbox(
+                            label="Question",
+                            placeholder="What is unusual in this image?",
+                            info="Ask anything about the image"
+                        )
+
+                        # Submit button
+                        img_submit_btn = gr.Button("Ask Question", variant="primary")
+
+                        # Output
+                        img_output = gr.Textbox(label="Model Response", interactive=False)
+
+                # Submit action
+                img_submit_btn.click(
+                    fn=analyze_image,
+                    inputs=[image_upload, url_input, prompt],
+                    outputs=img_output
                 )
-
-            # Conditionally visible image slider row
-            with gr.Row(visible=True) as image_slider_row:
-                num_images = gr.Slider(
-                    minimum=0,
-                    maximum=5,
-                    value=DEFAULT_NUM_IMAGES,
-                    step=1,
-                    label="Number of Images",
-                    info="Set to 0 to disable images",
-                    elem_classes="slider-label"
-                )
-
-        with gr.Row():
-            submit_btn = gr.Button("Send Text", variant="primary")
-            mic_btn = gr.Button("Transcribe Voice", variant="secondary")
-            mic = gr.Audio(
-                sources=["microphone"],
-                type="numpy",
-                label="Voice Input",
-                show_label=False,
-                elem_id="voice-input"
-            )
-
-        processing = gr.HTML("""
-            <div id="processing" style="display: none;">
-                <div class="processing">🔮 Processing your request...</div>
-            </div>
-        """)
-
-    # Toggle image slider visibility based on checkbox
-    def toggle_image_slider(include_visuals):
-        return gr.update(visible=include_visuals)
-    
-    include_images.change(
-        fn=toggle_image_slider,
-        inputs=include_images,
-        outputs=image_slider_row
-    )
-
-    def toggle_processing():
-        return gr.update(visible=True), gr.update(interactive=False)
-
-    def hide_processing():
-        return gr.update(visible=False), gr.update(interactive=True)
-
-    # Update the submit_btn click handler to include streaming
-    submit_btn.click(
-        fn=toggle_processing,
-        outputs=[processing, submit_btn]
-    ).then(
-        fn=lambda: (gr.update(visible=True), gr.update(interactive=False)),
-        outputs=[processing, submit_btn]
-    ).then(
-        fn=run_chat,
-        inputs=[user_input, state, include_images, max_tokens, num_images],
-        outputs=[chatbot, user_input]
-    ).then(
-        fn=lambda: (gr.update(visible=False), gr.update(interactive=True)),
-        outputs=[processing, submit_btn]
-    )
-
-    # Voice transcription remains the same
-    mic_btn.click(
-        fn=toggle_processing,
-        outputs=[processing, mic_btn]
-    ).then(
-        fn=transcribe,
-        inputs=mic,
-        outputs=user_input
-    ).then(
-        fn=hide_processing,
-        outputs=[processing, mic_btn]
-    )
 
 if __name__ == "__main__":
     demo.launch(share=True, debug=True)

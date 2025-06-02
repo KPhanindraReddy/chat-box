@@ -4,6 +4,12 @@ librosa>=0.10.0
 numpy>=1.24.0
 scipy>=1.10.0
 huggingface_hub>=0.21.4
-google-api-python-client
-
+google-api-python-client>=2.132.0
 py-cpuinfo>=8.0.0
+requests>=2.32.3
+Pillow>=10.3.0
+soundfile>=0.12.1
+openvino>=2024.1.0
+tqdm>=4.66.2
+protobuf>=4.25.3
+tokenizers>=0.19.1
