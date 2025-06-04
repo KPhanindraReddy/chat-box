@@ -1,330 +1,459 @@
-from huggingface_hub import snapshot_download
-import gradio as gr
-import openvino_genai
-import librosa
-import numpy as np
-from threading import Lock, Event
-from scipy.ndimage import uniform_filter1d
-from queue import Queue, Empty
-from googleapiclient.discovery import build
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-import cpuinfo
-import gc
+import gradio as gr
+import pandas as pd
+import openvino_genai
+from huggingface_hub import snapshot_download
+from threading import Lock
 import os
+import numpy as np
 import requests
 from PIL import Image
 from io import BytesIO
+import cpuinfo
 import openvino as ov
-import threading
+import librosa
+from googleapiclient.discovery import build
+import gc
+import tempfile
+from PyPDF2 import PdfReader
+from docx import Document
+import textwrap
 
-# Set CPU affinity for optimization
-os.environ["GOMP_CPU_AFFINITY"] = "0-7"  # Use first 8 CPU cores
-os.environ["OMP_NUM_THREADS"] = "8"
-
-# Configuration constants
+# Google API configuration
 GOOGLE_API_KEY = "AIzaSyAo-1iW5MEZbc53DlEldtnUnDaYuTHUDH4"
 GOOGLE_CSE_ID = "3027bedf3c88a4efb"
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_NUM_IMAGES = 1
-MAX_HISTORY_TURNS = 2
+MAX_HISTORY_TURNS = 3
 MAX_TOKENS_LIMIT = 1000
 
-# Download models
-start_time = time.time()
-snapshot_download(repo_id="OpenVINO/mistral-7b-instruct-v0.1-int8-ov", local_dir="mistral-ov")
-snapshot_download(repo_id="OpenVINO/whisper-tiny-fp16-ov", local_dir="whisper-ov-model")
-snapshot_download(repo_id="OpenVINO/InternVL2-1B-int8-ov", local_dir="internvl-ov")  # Added for image analysis
-print(f"Model download time: {time.time() - start_time:.2f} seconds")
+class UnifiedAISystem:
+    def __init__(self):
+        self.pipe_lock = Lock()
+        self.current_df = None
+        self.mistral_pipe = None
+        self.internvl_pipe = None
+        self.whisper_pipe = None
+        self.current_document_text = None  # Store document content
+        self.initialize_models()
 
-# CPU-specific configuration
-cpu_features = cpuinfo.get_cpu_info()['flags']
-config_options = {}
-if 'avx512' in cpu_features:
-    config_options["ENFORCE_BF16"] = "YES"
-    print("Using AVX512 optimizations")
-elif 'avx2' in cpu_features:
-    config_options["INFERENCE_PRECISION_HINT"] = "f32"
-    print("Using AVX2 optimizations")
+    def initialize_models(self):
+        """Initialize all required models"""
+        # Download models if not exists
+        if not os.path.exists("mistral-ov"):
+            snapshot_download(repo_id="OpenVINO/mistral-7b-instruct-v0.1-int8-ov", local_dir="mistral-ov")
+        if not os.path.exists("internvl-ov"):
+            snapshot_download(repo_id="OpenVINO/InternVL2-1B-int8-ov", local_dir="internvl-ov")
+        if not os.path.exists("whisper-ov-model"):
+            snapshot_download(repo_id="OpenVINO/whisper-tiny-fp16-ov", local_dir="whisper-ov-model")
 
-# Initialize models with performance flags
-start_time = time.time()
-mistral_pipe = openvino_genai.LLMPipeline(
-    "mistral-ov",
-    device="CPU",
-    config={
-        "PERFORMANCE_HINT": "THROUGHPUT",
-        **config_options
-    }
-)
+        # CPU-specific configuration
+        cpu_features = cpuinfo.get_cpu_info()['flags']
+        config_options = {}
+        if 'avx512' in cpu_features:
+            config_options["ENFORCE_BF16"] = "YES"
+        elif 'avx2' in cpu_features:
+            config_options["INFERENCE_PRECISION_HINT"] = "f32"
 
-whisper_pipe = openvino_genai.WhisperPipeline(
-    "whisper-ov-model",
-    device="CPU"
-)
-pipe_lock = Lock()
-print(f"Model initialization time: {time.time() - start_time:.2f} seconds")
+        # Initialize Mistral model
+        self.mistral_pipe = openvino_genai.LLMPipeline(
+            "mistral-ov",
+            device="CPU",
+            config={"PERFORMANCE_HINT": "THROUGHPUT", **config_options}
+        )
 
-# Initialize InternVL pipeline for image analysis (lazy loading)
-internvl_pipe = None
-internvl_lock = Lock()
+        # Initialize Whisper for audio processing
+        self.whisper_pipe = openvino_genai.WhisperPipeline("whisper-ov-model", device="CPU")
 
-def get_internvl_pipeline():
-    global internvl_pipe
-    with internvl_lock:
-        if internvl_pipe is None:
-            print("Initializing InternVL pipeline...")
-            start_time = time.time()
-            internvl_pipe = openvino_genai.VLMPipeline("internvl-ov", device="CPU")
-            print(f"InternVL pipeline initialization time: {time.time() - start_time:.2f} seconds")
-    return internvl_pipe
-
-# Warm up models
-print("Warming up models...")
-start_time = time.time()
-with pipe_lock:
-    mistral_pipe.generate("Warmup", openvino_genai.GenerationConfig(max_new_tokens=10))
-    whisper_pipe.generate(np.zeros(16000, dtype=np.float32))
-print(f"Model warmup time: {time.time() - start_time:.2f} seconds")
-
-# Thread pools
-generation_executor = ThreadPoolExecutor(max_workers=4)  # Increased workers
-image_executor = ThreadPoolExecutor(max_workers=8)
-
-def fetch_images(query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
-    """Fetch unique images by requesting different result pages"""
-    start_time = time.time()
-
-    if num <= 0:
-        return []
-
-    try:
-        service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
-        image_links = []
-        seen_urls = set()  # To track unique URLs
-
-        # Start from different positions to get unique images
-        for start_index in range(1, num * 2, 2):  # Step by 2 to get different pages
-            if len(image_links) >= num:
-                break
-
-            res = service.cse().list(
-                q=query,
-                cx=GOOGLE_CSE_ID,
-                searchType="image",
-                num=1,  # Get one result per request
-                start=start_index  # Start at different positions
-            ).execute()
-
-            if "items" in res and res["items"]:
-                item = res["items"][0]
-                # Skip duplicates
-                if item["link"] not in seen_urls:
-                    image_links.append(item["link"])
-                    seen_urls.add(item["link"])
-
-        print(f"Unique image fetch time: {time.time() - start_time:.2f} seconds")
-        return image_links[:num]  # Return only the requested number
-    except Exception as e:
-        print(f"Error in image fetching: {e}")
-        return []
-
-def process_audio(data, sr):
-    start_time = time.time()
-    data = librosa.to_mono(data.T) if data.ndim > 1 else data
-    data = data.astype(np.float32)
-    data /= np.max(np.abs(data))
-    rms = librosa.feature.rms(y=data, frame_length=2048, hop_length=512)[0]
-    smoothed_rms = uniform_filter1d(rms, size=5)
-    speech_frames = np.where(smoothed_rms > 0.025)[0]
-    if not speech_frames.size:
-        print(f"Audio processing time: {time.time() - start_time:.2f} seconds")
-        return None
-    start = max(0, int(speech_frames[0] * 512 - 0.1 * sr))
-    end = min(len(data), int((speech_frames[-1] + 1) * 512 + 0.1 * sr))
-    print(f"Audio processing time: {time.time() - start_time:.2f} seconds")
-    return data[start:end]
-
-def transcribe(audio):
-    start_time = time.time()
-    if audio is None:
-        print(f"Transcription time: {time.time() - start_time:.2f} seconds")
-        return ""
-    sr, data = audio
-    processed = process_audio(data, sr)
-    if processed is None or len(processed) < 1600:
-        print(f"Transcription time: {time.time() - start_time:.2f} seconds")
-        return ""
-    if sr != 16000:
-        processed = librosa.resample(processed, orig_sr=sr, target_sr=16000)
-    result = whisper_pipe.generate(processed)
-    print(f"Transcription time: {time.time() - start_time:.2f} seconds")
-    return result
-
-def stream_answer(message: str, max_tokens: int, include_images: bool) -> str:
-    start_time = time.time()
-    response_queue = Queue()
-    completion_event = Event()
-    error = [None]
-
-    optimized_config = openvino_genai.GenerationConfig(
-        max_new_tokens=max_tokens,
-        num_beams=1,
-        do_sample=False,
-        temperature=1.0,
-        top_p=0.9,
-        top_k=30,
-        streaming=True,
-        streaming_interval=5  # Batch tokens in groups of 5
-    )
-
-    def callback(tokens):  # Now accepts multiple tokens
-        response_queue.put("".join(tokens))
-        return openvino_genai.StreamingStatus.RUNNING
-
-    def generate():
+    def load_data(self, file_path):
+        """Load student data from file"""
         try:
-            with pipe_lock:
-                mistral_pipe.generate(message, optimized_config, callback)
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if file_ext == '.csv':
+                self.current_df = pd.read_csv(file_path)
+            elif file_ext in ['.xlsx', '.xls']:
+                self.current_df = pd.read_excel(file_path)
+            else:
+                return False, "❌ Unsupported file format. Please upload a .csv or .xlsx file."
+            return True, f"✅ Loaded {len(self.current_df)} records from {os.path.basename(file_path)}"
         except Exception as e:
-            error[0] = str(e)
-        finally:
-            completion_event.set()
+            return False, f"❌ Error loading file: {str(e)}"
 
-    generation_executor.submit(generate)
+    def extract_text_from_document(self, file_path):
+        """Extract text from PDF or DOCX documents"""
+        text = ""
+        try:
+            file_ext = os.path.splitext(file_path)[1].lower()
 
-    accumulated = []
-    token_count = 0
-    last_gc = time.time()
+            if file_ext == '.pdf':
+                with open(file_path, 'rb') as file:
+                    pdf_reader = PdfReader(file)
+                    for page in pdf_reader.pages:
+                        text += page.extract_text() + "\n"
 
-    while not completion_event.is_set() or not response_queue.empty():
-        if error[0]:
-            yield f"Error: {error[0]}"
-            print(f"Stream answer time: {time.time() - start_time:.2f} seconds")
+            elif file_ext == '.docx':
+                doc = Document(file_path)
+                for para in doc.paragraphs:
+                    text += para.text + "\n"
+
+            else:
+                return False, "❌ Unsupported document format. Please upload PDF or DOCX."
+
+            # Clean and format text
+            text = text.replace('\x0c', '')  # Remove form feed characters
+            text = textwrap.dedent(text)      # Remove common leading whitespace
+            self.current_document_text = text
+            return True, f"✅ Extracted text from {os.path.basename(file_path)}"
+
+        except Exception as e:
+            return False, f"❌ Error processing document: {str(e)}"
+
+    def analyze_student_data(self, query):
+        """Analyze student data using AI with streaming"""
+        if not query or not query.strip():
+            yield "⚠️ Please enter a valid question"
             return
 
+        if self.current_df is None:
+            yield "⚠️ Please upload and load a student data file first"
+            return
+
+        data_summary = self._prepare_data_summary(self.current_df)
+        prompt = f"""You are an expert education analyst. Analyze the following student performance data:
+        {data_summary}
+
+        Question: {query}
+
+        Please include:
+        1. Direct answer to the question
+        2. Relevant statistics
+        3. Key insights
+        4. Actionable recommendations
+
+        Format the output with clear headings"""
+
+        optimized_config = openvino_genai.GenerationConfig(
+            max_new_tokens=500,
+            temperature=0.3,
+            top_p=0.9,
+            streaming=True
+        )
+
+        full_response = ""
         try:
-            token_batch = response_queue.get_nowait()
-            accumulated.append(token_batch)
-            token_count += len(token_batch)
+            with self.pipe_lock:
+                token_iterator = self.mistral_pipe.generate(prompt, optimized_config, streaming=True)
+                for token in token_iterator:
+                    full_response += token
+                    yield full_response
+        except Exception as e:
+            yield f"❌ Error during analysis: {str(e)}"
 
-            # Periodic garbage collection
-            if time.time() - last_gc > 2.0:  # Every 2 seconds
-                gc.collect()
-                last_gc = time.time()
+    def _prepare_data_summary(self, df):
+        """Summarize the uploaded data"""
+        summary = f"Student performance data with {len(df)} rows and {len(df.columns)} columns.\n"
+        summary += "Columns: " + ", ".join(df.columns) + "\n"
+        summary += "First 3 rows:\n" + df.head(3).to_string(index=False)
+        return summary
 
-            yield "".join(accumulated)
-        except Empty:
-            continue
+    def analyze_image(self, image, url, prompt):
+        """Analyze image with InternVL model"""
+        try:
+            if image is not None:
+                image_source = image
+            elif url and url.startswith(("http://", "https://")):
+                response = requests.get(url)
+                image_source = Image.open(BytesIO(response.content)).convert("RGB")
+            else:
+                return "⚠️ Please upload an image or enter a valid URL"
 
-    print(f"Generated {token_count} tokens in {time.time() - start_time:.2f} seconds "
-          f"({token_count/(time.time() - start_time):.2f} tokens/sec)")
-    yield "".join(accumulated)
+            # Convert to OpenVINO tensor
+            image_data = np.array(image_source.getdata()).reshape(
+                1, image_source.size[1], image_source.size[0], 3
+            ).astype(np.byte)
+            image_tensor = ov.Tensor(image_data)
 
-def run_chat(message: str, history: list, include_images: bool, max_tokens: int, num_images: int):
-    start_time = time.time()
-    final_text = ""
+            # Lazy initialize InternVL
+            if self.internvl_pipe is None:
+                self.internvl_pipe = openvino_genai.VLMPipeline("internvl-ov", device="CPU")
 
-    # Create a placeholder for the streaming response
-    history.append((message, "", []))
-    rendered_history = render_history(history)
-    yield rendered_history, gr.update(value="", interactive=False)
+            with self.pipe_lock:
+                self.internvl_pipe.start_chat()
+                output = self.internvl_pipe.generate(prompt, image=image_tensor, max_new_tokens=100)
+                self.internvl_pipe.finish_chat()
 
-    # Stream tokens and update chatbot in real-time
-    for output in stream_answer(message, max_tokens, include_images):
-        final_text = output
-        # Update only the last response in history
-        updated_history = history[:-1] + [(message, final_text, [])]
-        rendered_history = render_history(updated_history)
-        yield rendered_history, gr.update(value="", interactive=False)
+            return output
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
 
-    images = []
-    if include_images:
-        images = fetch_images(message, num_images)
+    def process_audio(self, data, sr):
+        """Process audio data for speech recognition"""
+        try:
+            # Convert to mono
+            if data.ndim > 1:
+                data = np.mean(data, axis=1)  # Simple mono conversion
+            else:
+                data = data
 
-    # Update history with final response and images
-    history[-1] = (message, final_text, images)
-    if len(history) > MAX_HISTORY_TURNS:
-        history = history[-MAX_HISTORY_TURNS:]
+            # Convert to float32 and normalize
+            data = data.astype(np.float32)
+            max_val = np.max(np.abs(data)) + 1e-7
+            data /= max_val
 
-    rendered_history = render_history(history)
-    print(f"Total chat time: {time.time() - start_time:.2f} seconds")
-    yield rendered_history, gr.update(value="", interactive=True)
+            # Simple noise reduction
+            data = np.clip(data, -0.5, 0.5)
 
-def render_history(history):
-    start_time = time.time()
-    rendered = []
-    for user_msg, bot_msg, image_links in history:
-        text = bot_msg
-        if image_links:
-            images_html = "".join(
-                f"<img src='{url}' class='chat-image' onclick='showImage(\"{url}\")' />"
-                for url in image_links
-            )
-            text += f"<br><br><b>📸 Related Visuals:</b><br><div style='display: flex; flex-wrap: wrap;'>{images_html}</div>"
-        rendered.append((user_msg, text))
+            # Trim silence
+            energy = np.abs(data)
+            threshold = np.percentile(energy, 25)  # Simple threshold
+            mask = energy > threshold
+            indices = np.where(mask)[0]
 
-    return rendered
+            if len(indices) > 0:
+                start = max(0, indices[0] - 1000)
+                end = min(len(data), indices[-1] + 1000)
+                data = data[start:end]
 
-# ===== IMAGE ANALYSIS FUNCTIONS =====
-def load_image(image_source):
-    """Load image from various sources: file path, URL, or PIL Image"""
-    if isinstance(image_source, str):
-        if image_source.startswith(("http://", "https://")):
-            # Load from URL
-            response = requests.get(image_source)
-            image = Image.open(BytesIO(response.content)).convert("RGB")
-        else:
-            # Load from file path
-            image = Image.open(image_source).convert("RGB")
-    elif isinstance(image_source, Image.Image):
-        # Already a PIL image
-        image = image_source
-    else:
-        raise ValueError("Unsupported image input type")
+            # Resample if needed using simpler method
+            if sr != 16000:
+                # Calculate new length
+                new_length = int(len(data) * 16000 / sr)
+                # Linear interpolation for resampling
+                data = np.interp(
+                    np.linspace(0, len(data)-1, new_length),
+                    np.arange(len(data)),
+                    data
+                )
+                sr = 16000
 
-    # Convert to OpenVINO tensor
-    image_data = np.array(image.getdata()).reshape(1, image.size[1], image.size[0], 3).astype(np.byte)
-    return ov.Tensor(image_data)
+            return data
+        except Exception as e:
+            print(f"Audio processing error: {e}")
+            return np.array([], dtype=np.float32)
 
-def analyze_image(image, url, prompt):
-    try:
-        # Determine image source (priority: uploaded image > URL)
-        image_source = image if image is not None else url
+    def transcribe(self, audio):
+        """Transcribe audio using Whisper model with improved error handling"""
+        if audio is None:
+            return ""
+        sr, data = audio
 
-        if not image_source:
-            return "⚠️ Please upload an image or enter an image URL"
+        # Skip if audio is too short (less than 0.5 seconds)
+        if len(data)/sr < 0.5:
+            return ""
 
-        # Convert to OpenVINO tensor
-        image_tensor = load_image(image_source)
+        try:
+            processed = self.process_audio(data, sr)
 
-        # Get pipeline (lazy initialization)
-        pipe = get_internvl_pipeline()
+            # Skip if audio is still too short after processing
+            if len(processed) < 8000:  # 0.5 seconds at 16kHz
+                return ""
 
-        # Generate response with thread safety
-        with internvl_lock:
-            pipe.start_chat()
-            output = pipe.generate(prompt, image=image_tensor, max_new_tokens=100)
-            pipe.finish_chat()
+            # Use OpenVINO Whisper pipeline
+            result = self.whisper_pipe.generate(processed)
+            return result
+        except Exception as e:
+            print(f"Transcription error: {e}")
+            return "❌ Transcription failed - please try again"
 
-        return output
+    def generate_lesson_plan(self, topic, duration, additional_instructions=""):
+        """Generate a lesson plan based on document content"""
+        if not self.current_document_text:
+            return "⚠️ Please upload and process a document first"
 
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+        prompt = f"""As an expert educator, create a focused lesson plan using the provided content.
 
-# ===== GRADIO INTERFACE =====
+        **Core Requirements:**
+        1. TOPIC: {topic}
+        2. TOTAL DURATION: {duration} periods
+        3. ADDITIONAL INSTRUCTIONS: {additional_instructions or 'None'}
+
+        **Content Summary:**
+        {self.current_document_text[:2500]}... [truncated]
+
+        **Output Structure:**
+        1. PERIOD ALLOCATION (Break topic into {duration} logical segments):
+          - Period 1: [Subtopic 1]
+          - Period 2: [Subtopic 2]
+             ...
+
+        2. LEARNING OBJECTIVES (Max 3 bullet points)
+        3. TEACHING ACTIVITIES (One engaging method per period)
+        4. RESOURCES (Key materials from document)
+        5. ASSESSMENT (Simple checks for understanding)
+        6. PAGE REFERENCES (Specific source pages)
+
+**Key Rules:**
+- Strictly divide content into exactly {duration} periods
+- Prioritize document content over creativity
+- Keep objectives measurable
+- Use only document resources
+- Make page references specific"""
+
+
+        optimized_config = openvino_genai.GenerationConfig(
+            max_new_tokens=1200,
+            temperature=0.4,
+            top_p=0.85
+        )
+
+        try:
+            with self.pipe_lock:
+                return self.mistral_pipe.generate(prompt, optimized_config)
+        except Exception as e:
+            return f"❌ Error generating lesson plan: {str(e)}"
+
+    def fetch_images(self, query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
+        """Fetch unique images by requesting different result pages"""
+        if num <= 0:
+            return []
+
+        try:
+            service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
+            image_links = []
+            seen_urls = set()  # To track unique URLs
+
+            # Start from different positions to get unique images
+            for start_index in range(1, num * 2, 2):
+                if len(image_links) >= num:
+                    break
+
+                res = service.cse().list(
+                    q=query,
+                    cx=GOOGLE_CSE_ID,
+                    searchType="image",
+                    num=1,
+                    start=start_index
+                ).execute()
+
+                if "items" in res and res["items"]:
+                    item = res["items"][0]
+                    # Skip duplicates
+                    if item["link"] not in seen_urls:
+                        image_links.append(item["link"])
+                        seen_urls.add(item["link"])
+
+            return image_links[:num]
+        except Exception as e:
+            print(f"Error in image fetching: {e}")
+            return []
+
+    def stream_answer(self, message: str, max_tokens: int) -> str:
+        """Stream tokens with typing indicator"""
+        optimized_config = openvino_genai.GenerationConfig(
+            max_new_tokens=max_tokens,
+            temperature=0.7,
+            top_p=0.9,
+            streaming=True
+        )
+
+        full_response = ""
+        try:
+            with self.pipe_lock:
+                token_iterator = self.mistral_pipe.generate(message, optimized_config, streaming=True)
+                for token in token_iterator:
+                    full_response += token
+                    yield full_response
+                    # Periodic garbage collection
+                    if len(full_response) % 20 == 0:
+                        gc.collect()
+        except Exception as e:
+            yield f"❌ Error: {str(e)}"
+
+# Initialize global object
+ai_system = UnifiedAISystem()
+
+# CSS styles with improved output box
 css = """
-    .processing {
-        animation: pulse 1.5s infinite;
-        color: #4a5568;
-        padding: 10px;
-        border-radius: 5px;
-        text-align: center;
-        margin: 10px 0;
+    .gradio-container {
+        background-color: #121212;
+        color: #fff;
     }
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
+    .user-msg, .bot-msg {
+        padding: 12px 16px;
+        border-radius: 18px;
+        margin: 8px 0;
+        line-height: 1.5;
+        border: none;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .user-msg {
+        background: linear-gradient(135deg, #4a5568, #2d3748);
+        color: white;
+        margin-left: 20%;
+        border-bottom-right-radius: 5px;
+        border: none;
+    }
+    .bot-msg {
+        background: linear-gradient(135deg, #2d3748, #1a202c);
+        color: white;
+        margin-right: 20%;
+        border-bottom-left-radius: 5px;
+        border: none;
+    }
+    /* Remove top border from chat messages */
+    .user-msg, .bot-msg {
+        border-top: none !important;
+    }
+    /* Remove borders from chat container */
+    .chatbot > div {
+        border: none !important;
+    }
+    .chatbot .message {
+        border: none !important;
+    }
+    /* Improve scrollbar */
+    .chatbot::-webkit-scrollbar {
+        width: 8px;
+    }
+    .chatbot::-webkit-scrollbar-track {
+        background: #2a2a2a;
+        border-radius: 4px;
+    }
+    .chatbot::-webkit-scrollbar-thumb {
+        background: #4a5568;
+        border-radius: 4px;
+    }
+    .chatbot::-webkit-scrollbar-thumb:hover {
+        background: #5a6578;
+    }
+    /* Rest of the CSS remains the same */
+    .gradio-container {
+        background-color: #121212;
+        color: #fff;
+    }
+    .upload-box {
+        background-color: #333;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 16px;
+    }
+    #question-input {
+        background-color: #333;
+        color: #fff;
+        border-radius: 8px;
+        padding: 12px;
+        border: 1px solid #555;
+    }
+    .mode-checkbox {
+        background-color: #333;
+        color: #fff;
+        border: 1px solid #555;
+        border-radius: 8px;
+        padding: 10px;
+        margin: 5px;
+    }
+    .slider-container {
+        margin-top: 20px;
+        padding: 15px;
+        border-radius: 10px;
+        background-color: #2a2a2a;
+    }
+    .system-info {
+        background-color: #7B9BDB;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 15px 0;
+        border-left: 4px solid #1890ff;
     }
     .chat-image {
         cursor: pointer;
@@ -367,29 +496,6 @@ css = """
         max-height: 100%;
         border-radius: 8px;
     }
-    .chat-container {
-        border: 1px solid #e5e7eb;
-        border-radius: 12px;
-        padding: 20px;
-        margin-bottom: 20px;
-    }
-    .slider-container {
-        margin-top: 20px;
-        padding: 15px;
-        border-radius: 10px;
-        background-color: #f8f9fa;
-    }
-    .slider-label {
-        font-weight: bold;
-        margin-bottom: 5px;
-    }
-    .system-info {
-        background-color: #7B9BDB;
-        padding: 15px;
-        border-radius: 8px;
-        margin: 15px 0;
-        border-left: 4px solid #1890ff;
-    }
     .typing-indicator {
         display: inline-block;
         position: relative;
@@ -401,7 +507,7 @@ css = """
         width: 6px;
         height: 6px;
         border-radius: 50%;
-        background-color: #4a5568;
+        background-color: #fff;
         position: absolute;
         animation: typing 1.4s infinite ease-in-out;
     }
@@ -421,23 +527,37 @@ css = """
         0%, 60%, 100% { transform: translateY(0); }
         30% { transform: translateY(-5px); }
     }
-    .tab-container {
+    .lesson-plan {
+        background: linear-gradient(135deg, #1a202c, #2d3748);
+        padding: 15px;
         border-radius: 12px;
-        padding: 20px;
-        background:#3fc9f8;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-        margin-bottom: 20px;
+        margin: 10px 0;
+        border-left: 4px solid #4a9df0;
     }
-    .tab-header {
-        font-size: 24px;
-        margin-bottom: 20px;
+    .lesson-section {
+        margin-bottom: 15px;
         padding-bottom: 10px;
-        border-bottom: 2px solid #e5e7eb;
+        border-bottom: 1px solid #4a5568;
+    }
+    .lesson-title {
+        font-size: 1.2em;
+        font-weight: bold;
+        color: #4a9df0;
+        margin-bottom: 8px;
+    }
+    .page-ref {
+        background-color: #4a5568;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 0.9em;
+        display: inline-block;
+        margin: 3px;
     }
 """
 
-with gr.Blocks(css=css, title="EDU Chat by Phanindra Reddy K") as demo:
-    gr.Markdown("# 🤖 EDU CHAT BY PHANINDRA REDDY K")
+# Create Gradio interface
+with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
+    gr.Markdown("# 🤖 Unified EDU Assistant by Phanindra Reddy K")
 
     # System info banner
     gr.HTML("""
@@ -446,11 +566,14 @@ with gr.Blocks(css=css, title="EDU Chat by Phanindra Reddy K") as demo:
         <ul>
             <li>Text & Voice Chat with Mistral-7B</li>
             <li>Image Understanding with InternVL</li>
-            <li>Optimized for High-RAM Systems</li>
+            <li>Student Data Analysis</li>
+            <li>Visual Search with Google Images</li>
+            <li>Lesson Planning from Documents</li>
         </ul>
     </div>
     """)
 
+    # Modal for image preview
     modal_html = """
     <div class="modal" id="imageModal" onclick="this.style.display='none'">
         <div class="modal-content">
@@ -466,173 +589,291 @@ with gr.Blocks(css=css, title="EDU Chat by Phanindra Reddy K") as demo:
     """
     gr.HTML(modal_html)
 
-    # Create tabs for different functionalities
-    with gr.Tabs():
-        # ===== MAIN CHAT TAB =====
-        with gr.Tab("💬 Chat Assistant", id="chat_tab"):
-            state = gr.State([])
+    chat_state = gr.State([])
+    with gr.Column(scale=2, elem_classes="chat-container"):
+        chatbot = gr.Chatbot(label="Conversation", height=500, bubble_full_width=False,
+                            avatar_images=("user.png", "bot.png"), show_label=False)
 
-            with gr.Column(scale=2, elem_classes="chat-container"):
-                chatbot = gr.Chatbot(label="Conversation", height=500, bubble_full_width=False)
+    # Mode selection
+    with gr.Row():
+        chat_mode = gr.Checkbox(label="💬 General Chat", value=True, elem_classes="mode-checkbox")
+        student_mode = gr.Checkbox(label="🎓 Student Analytics", value=False, elem_classes="mode-checkbox")
+        image_mode = gr.Checkbox(label="🖼️ Image Analysis", value=False, elem_classes="mode-checkbox")
+        lesson_mode = gr.Checkbox(label="📝 Lesson Planning", value=False, elem_classes="mode-checkbox")
 
-            with gr.Column(scale=1):
-                gr.Markdown("### 💬 Ask Your Question")
-
-                with gr.Row():
-                    user_input = gr.Textbox(
-                        placeholder="Type your question here...",
-                        label="",
-                        container=False,
-                        elem_id="question-input"
-                    )
-                    include_images = gr.Checkbox(
-                        label="Include Visuals",
-                        value=True,
-                        container=False,
-                        elem_id="image-checkbox"
-                    )
-
-                # Add the sliders container
-                with gr.Column(elem_classes="slider-container"):
-                    gr.Markdown("### ⚙️ Generation Settings")
-
-                    with gr.Row():
-                        max_tokens = gr.Slider(
-                            minimum=10,
-                            maximum=MAX_TOKENS_LIMIT,  # Increased to 1000
-                            value=DEFAULT_MAX_TOKENS,
-                            step=10,
-                            label="Response Length (Tokens)",
-                            info=f"Max: {MAX_TOKENS_LIMIT} tokens (for detailed explanations)",
-                            elem_classes="slider-label"
-                        )
-
-                    # Conditionally visible image slider row
-                    with gr.Row(visible=True) as image_slider_row:
-                        num_images = gr.Slider(
-                            minimum=0,
-                            maximum=5,
-                            value=DEFAULT_NUM_IMAGES,
-                            step=1,
-                            label="Number of Images",
-                            info="Set to 0 to disable images",
-                            elem_classes="slider-label"
-                        )
-
-                with gr.Row():
-                    submit_btn = gr.Button("Send Text", variant="primary")
-                    mic_btn = gr.Button("Transcribe Voice", variant="secondary")
-                    mic = gr.Audio(
-                        sources=["microphone"],
-                        type="numpy",
-                        label="Voice Input",
-                        show_label=False,
-                        elem_id="voice-input"
-                    )
-
-                processing = gr.HTML("""
-                    <div id="processing" style="display: none;">
-                        <div class="processing">🔮 Processing your request...</div>
-                    </div>
-                """)
-
-            # Toggle image slider visibility based on checkbox
-            def toggle_image_slider(include_visuals):
-                return gr.update(visible=include_visuals)
-
-            include_images.change(
-                fn=toggle_image_slider,
-                inputs=include_images,
-                outputs=image_slider_row
+    # Dynamic input fields
+    with gr.Column() as chat_inputs:
+        include_images = gr.Checkbox(label="Include Visuals", value=True)
+        user_input = gr.Textbox(
+            placeholder="Type your question here...",
+            label="Your Question",
+            container=False,
+            elem_id="question-input"
+        )
+        with gr.Row():
+            max_tokens = gr.Slider(
+                minimum=10,
+                maximum=1000,
+                value=100,
+                step=10,
+                label="Response Length (Tokens)"
+            )
+            num_images = gr.Slider(
+                minimum=0,
+                maximum=5,
+                value=1,
+                step=1,
+                label="Number of Images",
+                visible=True
             )
 
-            def toggle_processing():
-                return gr.update(visible=True), gr.update(interactive=False)
+    with gr.Column(visible=False) as student_inputs:
+        file_upload = gr.File(label="CSV/Excel File", file_types=[".csv", ".xlsx"], type="filepath")
+        student_question = gr.Textbox(
+            placeholder="Ask questions about student data...",
+            label="Your Question",
+            elem_id="question-input"
+        )
+        student_status = gr.Markdown("No file loaded")
 
-            def hide_processing():
-                return gr.update(visible=False), gr.update(interactive=True)
+    with gr.Column(visible=False) as image_inputs:
+        image_upload = gr.Image(type="pil", label="Upload Image")
+        image_url = gr.Textbox(
+            label="OR Enter Image URL",
+            placeholder="https://example.com/image.jpg",
+            elem_id="question-input"
+        )
+        image_question = gr.Textbox(
+            placeholder="Ask questions about the image...",
+            label="Your Question",
+            elem_id="question-input"
+        )
 
-            # Update the submit_btn click handler to include streaming
-            submit_btn.click(
-                fn=toggle_processing,
-                outputs=[processing, submit_btn]
-            ).then(
-                fn=lambda: (gr.update(visible=True), gr.update(interactive=False)),
-                outputs=[processing, submit_btn]
-            ).then(
-                fn=run_chat,
-                inputs=[user_input, state, include_images, max_tokens, num_images],
-                outputs=[chatbot, user_input]
-            ).then(
-                fn=lambda: (gr.update(visible=False), gr.update(interactive=True)),
-                outputs=[processing, submit_btn]
+    # Lesson planning section
+    with gr.Column(visible=False) as lesson_inputs:
+        gr.Markdown("### 📚 Lesson Planning")
+        doc_upload = gr.File(
+            label="Upload Curriculum Document (PDF/DOCX)",
+            file_types=[".pdf", ".docx"],
+            type="filepath"
+        )
+        doc_status = gr.Markdown("No document uploaded")
+
+        with gr.Row():
+            topic_input = gr.Textbox(
+                label="Lesson Topic",
+                placeholder="Enter the main topic for the lesson plan"
+            )
+            duration_input = gr.Number(
+                label="Total Periods",
+                value=5,
+                minimum=1,
+                maximum=20,
+                step=1
             )
 
-            # Voice transcription
-            mic_btn.click(
-                fn=toggle_processing,
-                outputs=[processing, mic_btn]
-            ).then(
-                fn=transcribe,
-                inputs=mic,
-                outputs=user_input
-            ).then(
-                fn=hide_processing,
-                outputs=[processing, mic_btn]
-            )
+        additional_instructions = gr.Textbox(
+            label="Additional Requirements (optional)",
+            placeholder="Specific teaching methods, resources, or special considerations..."
+        )
 
-        # ===== IMAGE ANALYSIS TAB =====
-        with gr.Tab("🖼️ Image Analysis", id="image_tab"):
-            with gr.Column(elem_classes="tab-container"):
-                gr.Markdown("## 🖼️ Image Understanding with InternVL")
-                gr.Markdown("Upload an image or enter a URL, then ask questions about it")
+        generate_btn = gr.Button("Generate Lesson Plan", variant="primary")
 
-                with gr.Row():
-                    with gr.Column():
-                        # Image upload
-                        image_upload = gr.Image(type="pil", label="Upload Image")
+    # Common controls
+    with gr.Row():
+        submit_btn = gr.Button("Send", variant="primary")
+        mic_btn = gr.Button("Transcribe Voice", variant="secondary")
+        mic = gr.Audio(sources=["microphone"], type="numpy", label="Voice Input")
 
-                        # URL input
-                        url_input = gr.Textbox(
-                            label="OR Enter Image URL",
-                            placeholder="https://example.com/image.jpg",
-                            info="Enter a direct image URL"
-                        )
+    processing = gr.HTML("""
+        <div style="display: none;">
+            <div class="processing">🔮 Processing your request...</div>
+        </div>
+    """)
 
-                        # Preview image
-                        preview = gr.Image(label="Preview", interactive=False)
+    # Event handlers
+    def toggle_modes(chat, student, image, lesson):
+        return [
+            gr.update(visible=chat),
+            gr.update(visible=student),
+            gr.update(visible=image),
+            gr.update(visible=lesson)
+        ]
 
-                        # Update preview when inputs change
-                        def update_preview(img, url):
-                            if img is not None:
-                                return img
-                            elif url and url.startswith(("http://", "https://")):
-                                return url
-                            return None
+    def load_student_file(file_path):
+        success, message = ai_system.load_data(file_path)
+        return message
 
-                        image_upload.change(update_preview, [image_upload, url_input], preview)
-                        url_input.change(update_preview, [image_upload, url_input], preview)
+    def process_document(file_path):
+        if not file_path:
+            return "⚠️ Please select a document first"
+        success, message = ai_system.extract_text_from_document(file_path)
+        return message
 
-                    with gr.Column():
-                        # Question input
-                        prompt = gr.Textbox(
-                            label="Question",
-                            placeholder="What is unusual in this image?",
-                            info="Ask anything about the image"
-                        )
+    def render_history(history):
+        """Render chat history with images and proper formatting"""
+        rendered = []
+        for user_msg, bot_msg, image_links in history:
+            # Apply proper styling to messages
+            user_html = f"<div class='user-msg'>{user_msg}</div>"
 
-                        # Submit button
-                        img_submit_btn = gr.Button("Ask Question", variant="primary")
+            # Special formatting for lesson plans
+            if "Lesson Plan:" in bot_msg:
+                bot_html = f"<div class='lesson-plan'>{bot_msg}</div>"
+            else:
+                bot_html = f"<div class='bot-msg'>{bot_msg}</div>"
 
-                        # Output
-                        img_output = gr.Textbox(label="Model Response", interactive=False)
-
-                # Submit action
-                img_submit_btn.click(
-                    fn=analyze_image,
-                    inputs=[image_upload, url_input, prompt],
-                    outputs=img_output
+            # Add images if available
+            if image_links:
+                images_html = "".join(
+                    f"<img src='{url}' class='chat-image' onclick='showImage(\"{url}\")' />"
+                    for url in image_links
                 )
+                bot_html += f"<br><br><b>📸 Related Visuals:</b><br><div style='display: flex; flex-wrap: wrap;'>{images_html}</div>"
+
+            rendered.append((user_html, bot_html))
+        return rendered
+
+    def respond(message, chat_hist, chat, student, image, lesson,
+               tokens, student_q, image_q, image_upload, image_url,
+               include_visuals, num_imgs):
+        # If in lesson planning mode, skip this handler
+        if lesson:
+            return chat_hist, message
+
+        # Determine the actual question based on mode
+        if chat:
+            actual_question = message
+        elif student:
+            actual_question = student_q
+        elif image:
+            actual_question = image_q
+        else:
+            actual_question = message
+
+        # Immediately show user question in chat
+        typing_html = "<div class='typing-indicator'><div class='typing-dot'></div><div class='typing-dot'></div><div class='typing-dot'></div></div>"
+        chat_hist.append((actual_question, typing_html, []))
+        yield render_history(chat_hist), ""
+
+        if chat:
+            # General chat mode
+            full_response = ""
+            for chunk in ai_system.stream_answer(message, tokens):
+                full_response = chunk
+                # Update with current response
+                chat_hist[-1] = (actual_question, full_response, [])
+                yield render_history(chat_hist), ""
+
+            # Fetch images if requested
+            image_links = []
+            if include_visuals and num_imgs > 0:
+                image_links = ai_system.fetch_images(message, num_imgs)
+
+            # Update with final response and images
+            chat_hist[-1] = (actual_question, full_response, image_links)
+            yield render_history(chat_hist), ""
+
+        elif student:
+            # Student analytics mode
+            if ai_system.current_df is None:
+                chat_hist[-1] = (actual_question, "⚠️ Please upload a student data file first", [])
+                yield render_history(chat_hist), ""
+            else:
+                response = ""
+                for chunk in ai_system.analyze_student_data(student_q):
+                    response = chunk
+                    chat_hist[-1] = (actual_question, response, [])
+                    yield render_history(chat_hist), ""
+
+        elif image:
+            # Image analysis mode
+            if not image_upload and not image_url:
+                chat_hist[-1] = (actual_question, "⚠️ Please upload an image or enter a URL", [])
+                yield render_history(chat_hist), ""
+            else:
+                try:
+                    result = ai_system.analyze_image(image_upload, image_url, image_q)
+                    chat_hist[-1] = (actual_question, result, [])
+                    yield render_history(chat_hist), ""
+                except Exception as e:
+                    error_msg = f"❌ Error analyzing image: {str(e)}"
+                    chat_hist[-1] = (actual_question, error_msg, [])
+                    yield render_history(chat_hist), ""
+
+        # Trim history if too long
+        if len(chat_hist) > MAX_HISTORY_TURNS:
+            chat_hist = chat_hist[-MAX_HISTORY_TURNS:]
+
+        yield render_history(chat_hist), ""
+
+    def generate_lesson_plan(topic, duration, instructions, chat_hist):
+        if not topic:
+            return chat_hist, "⚠️ Please enter a lesson topic"
+
+        # Show processing message
+        processing_msg = "<div class='typing-indicator'><div class='typing-dot'></div><div class='typing-dot'></div><div class='typing-dot'></div></div>"
+        chat_hist.append((f"Generate lesson plan for: {topic}", processing_msg, []))
+        yield render_history(chat_hist), ""
+
+        # Generate the plan
+        plan = ai_system.generate_lesson_plan(topic, duration, instructions)
+
+        # Format with proper headings
+        formatted_plan = f"""
+        <div class='lesson-plan'>
+            <div class='lesson-title'>📝 Lesson Plan: {topic} ({duration} periods)</div>
+            {plan}
+        </div>
+        """
+
+        # Update chat history with final plan
+        chat_hist[-1] = (
+            f"Generate lesson plan for: {topic}",
+            formatted_plan,
+            []
+        )
+        yield render_history(chat_hist), ""
+
+    # Mode toggles
+    chat_mode.change(fn=toggle_modes, inputs=[chat_mode, student_mode, image_mode, lesson_mode],
+                   outputs=[chat_inputs, student_inputs, image_inputs, lesson_inputs])
+    student_mode.change(fn=toggle_modes, inputs=[chat_mode, student_mode, image_mode, lesson_mode],
+                      outputs=[chat_inputs, student_inputs, image_inputs, lesson_inputs])
+    image_mode.change(fn=toggle_modes, inputs=[chat_mode, student_mode, image_mode, lesson_mode],
+                    outputs=[chat_inputs, student_inputs, image_inputs, lesson_inputs])
+    lesson_mode.change(fn=toggle_modes, inputs=[chat_mode, student_mode, image_mode, lesson_mode],
+                     outputs=[chat_inputs, student_inputs, image_inputs, lesson_inputs])
+
+    # File upload handler
+    file_upload.change(fn=load_student_file, inputs=file_upload, outputs=student_status)
+
+    # Document upload handler
+    doc_upload.change(fn=process_document, inputs=doc_upload, outputs=doc_status)
+
+    # Voice transcription
+    def transcribe_audio(audio):
+        return ai_system.transcribe(audio)
+
+    mic_btn.click(fn=transcribe_audio, inputs=mic, outputs=user_input)
+
+    # Submit handler
+    submit_btn.click(
+        fn=respond,
+        inputs=[
+            user_input, chat_state, chat_mode, student_mode, image_mode, lesson_mode,
+            max_tokens, student_question, image_question, image_upload, image_url,
+            include_images, num_images
+        ],
+        outputs=[chatbot, user_input]
+    )
+
+    # Lesson plan generation button
+    generate_btn.click(
+        fn=generate_lesson_plan,
+        inputs=[topic_input, duration_input, additional_instructions, chat_state],
+        outputs=[chatbot, topic_input]
+    )
 
 if __name__ == "__main__":
     demo.launch(share=True, debug=True)
