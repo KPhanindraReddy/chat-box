@@ -3,7 +3,7 @@ import gradio as gr
 import pandas as pd
 import openvino_genai
 from huggingface_hub import snapshot_download
-from threading import Lock
+from threading import Lock, Event
 import os
 import numpy as np
 import requests
@@ -14,10 +14,12 @@ import openvino as ov
 import librosa
 from googleapiclient.discovery import build
 import gc
-import tempfile
 from PyPDF2 import PdfReader
 from docx import Document
 import textwrap
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
+from typing import Generator
 
 # Google API configuration
 GOOGLE_API_KEY = "AIzaSyAo-1iW5MEZbc53DlEldtnUnDaYuTHUDH4"
@@ -34,7 +36,8 @@ class UnifiedAISystem:
         self.mistral_pipe = None
         self.internvl_pipe = None
         self.whisper_pipe = None
-        self.current_document_text = None  # Store document content
+        self.current_document_text = None
+        self.generation_executor = ThreadPoolExecutor(max_workers=3)
         self.initialize_models()
 
     def initialize_models(self):
@@ -108,7 +111,65 @@ class UnifiedAISystem:
         except Exception as e:
             return False, f"❌ Error processing document: {str(e)}"
 
-    def analyze_student_data(self, query):
+    def generate_text_stream(self, prompt: str, max_tokens: int) -> Generator[str, None, None]:
+        """Unified text generation with queued token streaming"""
+        start_time = time.time()
+        response_queue = Queue()
+        completion_event = Event()
+        error = [None]  # Use list to capture exception from thread
+
+        optimized_config = openvino_genai.GenerationConfig(
+            max_new_tokens=max_tokens,
+            temperature=0.3,
+            top_p=0.9,
+            streaming=True,
+            streaming_interval=5  # Batch tokens in groups of 5
+        )
+
+        def callback(tokens):  # Accepts multiple tokens
+            response_queue.put("".join(tokens))
+            return openvino_genai.StreamingStatus.RUNNING
+
+        def generate():
+            try:
+                with self.pipe_lock:
+                    self.mistral_pipe.generate(prompt, optimized_config, callback)
+            except Exception as e:
+                error[0] = str(e)
+            finally:
+                completion_event.set()
+
+        # Submit generation task to executor
+        self.generation_executor.submit(generate)
+
+        accumulated = []
+        token_count = 0
+        last_gc = time.time()
+
+        while not completion_event.is_set() or not response_queue.empty():
+            if error[0]:
+                yield f"❌ Error: {error[0]}"
+                print(f"Stream generation time: {time.time() - start_time:.2f} seconds")
+                return
+
+            try:
+                token_batch = response_queue.get(timeout=0.1)
+                accumulated.append(token_batch)
+                token_count += len(token_batch)
+                yield "".join(accumulated)
+
+                # Periodic garbage collection
+                if time.time() - last_gc > 2.0:
+                    gc.collect()
+                    last_gc = time.time()
+            except Empty:
+                continue
+
+        print(f"Generated {token_count} tokens in {time.time() - start_time:.2f} seconds "
+              f"({token_count/(time.time() - start_time):.2f} tokens/sec)")
+        yield "".join(accumulated)
+
+    def analyze_student_data(self, query, max_tokens=500):
         """Analyze student data using AI with streaming"""
         if not query or not query.strip():
             yield "⚠️ Please enter a valid question"
@@ -131,23 +192,9 @@ class UnifiedAISystem:
         4. Actionable recommendations
 
         Format the output with clear headings"""
-
-        optimized_config = openvino_genai.GenerationConfig(
-            max_new_tokens=500,
-            temperature=0.3,
-            top_p=0.9,
-            streaming=True
-        )
-
-        full_response = ""
-        try:
-            with self.pipe_lock:
-                token_iterator = self.mistral_pipe.generate(prompt, optimized_config, streaming=True)
-                for token in token_iterator:
-                    full_response += token
-                    yield full_response
-        except Exception as e:
-            yield f"❌ Error during analysis: {str(e)}"
+        
+        # Use unified streaming generator
+        yield from self.generate_text_stream(prompt, max_tokens)
 
     def _prepare_data_summary(self, df):
         """Summarize the uploaded data"""
@@ -157,7 +204,7 @@ class UnifiedAISystem:
         return summary
 
     def analyze_image(self, image, url, prompt):
-        """Analyze image with InternVL model"""
+        """Analyze image with InternVL model (synchronous, no streaming)"""
         try:
             if image is not None:
                 image_source = image
@@ -182,7 +229,9 @@ class UnifiedAISystem:
                 output = self.internvl_pipe.generate(prompt, image=image_tensor, max_new_tokens=100)
                 self.internvl_pipe.finish_chat()
 
+            # output is a VLMDecodedResults; rest of the code expects a string
             return output
+
         except Exception as e:
             return f"❌ Error: {str(e)}"
 
@@ -255,10 +304,15 @@ class UnifiedAISystem:
             print(f"Transcription error: {e}")
             return "❌ Transcription failed - please try again"
 
-    def generate_lesson_plan(self, topic, duration, additional_instructions=""):
+    def generate_lesson_plan(self, topic, duration, additional_instructions="", max_tokens=1200):
         """Generate a lesson plan based on document content"""
+        if not topic:
+            yield "⚠️ Please enter a lesson topic"
+            return
+            
         if not self.current_document_text:
-            return "⚠️ Please upload and process a document first"
+            yield "⚠️ Please upload and process a document first"
+            return
 
         prompt = f"""As an expert educator, create a focused lesson plan using the provided content.
 
@@ -288,19 +342,9 @@ class UnifiedAISystem:
 - Keep objectives measurable
 - Use only document resources
 - Make page references specific"""
-
-
-        optimized_config = openvino_genai.GenerationConfig(
-            max_new_tokens=1200,
-            temperature=0.4,
-            top_p=0.85
-        )
-
-        try:
-            with self.pipe_lock:
-                return self.mistral_pipe.generate(prompt, optimized_config)
-        except Exception as e:
-            return f"❌ Error generating lesson plan: {str(e)}"
+        
+        # Use unified streaming generator
+        yield from self.generate_text_stream(prompt, max_tokens)
 
     def fetch_images(self, query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
         """Fetch unique images by requesting different result pages"""
@@ -336,28 +380,6 @@ class UnifiedAISystem:
         except Exception as e:
             print(f"Error in image fetching: {e}")
             return []
-
-    def stream_answer(self, message: str, max_tokens: int) -> str:
-        """Stream tokens with typing indicator"""
-        optimized_config = openvino_genai.GenerationConfig(
-            max_new_tokens=max_tokens,
-            temperature=0.7,
-            top_p=0.9,
-            streaming=True
-        )
-
-        full_response = ""
-        try:
-            with self.pipe_lock:
-                token_iterator = self.mistral_pipe.generate(message, optimized_config, streaming=True)
-                for token in token_iterator:
-                    full_response += token
-                    yield full_response
-                    # Periodic garbage collection
-                    if len(full_response) % 20 == 0:
-                        gc.collect()
-        except Exception as e:
-            yield f"❌ Error: {str(e)}"
 
 # Initialize global object
 ai_system = UnifiedAISystem()
@@ -601,7 +623,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         image_mode = gr.Checkbox(label="🖼️ Image Analysis", value=False, elem_classes="mode-checkbox")
         lesson_mode = gr.Checkbox(label="📝 Lesson Planning", value=False, elem_classes="mode-checkbox")
 
-    # Dynamic input fields
+    # Dynamic input fields (General Chat by default)
     with gr.Column() as chat_inputs:
         include_images = gr.Checkbox(label="Include Visuals", value=True)
         user_input = gr.Textbox(
@@ -627,6 +649,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
                 visible=True
             )
 
+    # Student inputs
     with gr.Column(visible=False) as student_inputs:
         file_upload = gr.File(label="CSV/Excel File", file_types=[".csv", ".xlsx"], type="filepath")
         student_question = gr.Textbox(
@@ -636,6 +659,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         )
         student_status = gr.Markdown("No file loaded")
 
+    # Image analysis inputs
     with gr.Column(visible=False) as image_inputs:
         image_upload = gr.Image(type="pil", label="Upload Image")
         image_url = gr.Textbox(
@@ -649,7 +673,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
             elem_id="question-input"
         )
 
-    # Lesson planning section
+    # Lesson planning inputs
     with gr.Column(visible=False) as lesson_inputs:
         gr.Markdown("### 📚 Lesson Planning")
         doc_upload = gr.File(
@@ -685,12 +709,6 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         mic_btn = gr.Button("Transcribe Voice", variant="secondary")
         mic = gr.Audio(sources=["microphone"], type="numpy", label="Voice Input")
 
-    processing = gr.HTML("""
-        <div style="display: none;">
-            <div class="processing">🔮 Processing your request...</div>
-        </div>
-    """)
-
     # Event handlers
     def toggle_modes(chat, student, image, lesson):
         return [
@@ -714,14 +732,15 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         """Render chat history with images and proper formatting"""
         rendered = []
         for user_msg, bot_msg, image_links in history:
-            # Apply proper styling to messages
             user_html = f"<div class='user-msg'>{user_msg}</div>"
 
-            # Special formatting for lesson plans
-            if "Lesson Plan:" in bot_msg:
-                bot_html = f"<div class='lesson-plan'>{bot_msg}</div>"
+            # Ensure bot_msg is a string before checking substrings
+            bot_text = str(bot_msg)
+
+            if "Lesson Plan:" in bot_text:
+                bot_html = f"<div class='lesson-plan'>{bot_text}</div>"
             else:
-                bot_html = f"<div class='bot-msg'>{bot_msg}</div>"
+                bot_html = f"<div class='bot-msg'>{bot_text}</div>"
 
             # Add images if available
             if image_links:
@@ -734,106 +753,94 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
             rendered.append((user_html, bot_html))
         return rendered
 
-    def respond(message, chat_hist, chat, student, image, lesson,
+    def respond(message, history, chat, student, image, lesson,
                tokens, student_q, image_q, image_upload, image_url,
-               include_visuals, num_imgs):
-        # If in lesson planning mode, skip this handler
-        if lesson:
-            return chat_hist, message
-
-        # Determine the actual question based on mode
-        if chat:
-            actual_question = message
-        elif student:
-            actual_question = student_q
-        elif image:
-            actual_question = image_q
-        else:
-            actual_question = message
-
-        # Immediately show user question in chat
-        typing_html = "<div class='typing-indicator'><div class='typing-dot'></div><div class='typing-dot'></div><div class='typing-dot'></div></div>"
-        chat_hist.append((actual_question, typing_html, []))
-        yield render_history(chat_hist), ""
-
-        if chat:
-            # General chat mode
-            full_response = ""
-            for chunk in ai_system.stream_answer(message, tokens):
-                full_response = chunk
-                # Update with current response
-                chat_hist[-1] = (actual_question, full_response, [])
-                yield render_history(chat_hist), ""
-
-            # Fetch images if requested
-            image_links = []
-            if include_visuals and num_imgs > 0:
-                image_links = ai_system.fetch_images(message, num_imgs)
-
-            # Update with final response and images
-            chat_hist[-1] = (actual_question, full_response, image_links)
-            yield render_history(chat_hist), ""
-
-        elif student:
-            # Student analytics mode
-            if ai_system.current_df is None:
-                chat_hist[-1] = (actual_question, "⚠️ Please upload a student data file first", [])
-                yield render_history(chat_hist), ""
-            else:
-                response = ""
-                for chunk in ai_system.analyze_student_data(student_q):
-                    response = chunk
-                    chat_hist[-1] = (actual_question, response, [])
-                    yield render_history(chat_hist), ""
-
-        elif image:
-            # Image analysis mode
-            if not image_upload and not image_url:
-                chat_hist[-1] = (actual_question, "⚠️ Please upload an image or enter a URL", [])
-                yield render_history(chat_hist), ""
-            else:
-                try:
-                    result = ai_system.analyze_image(image_upload, image_url, image_q)
-                    chat_hist[-1] = (actual_question, result, [])
-                    yield render_history(chat_hist), ""
-                except Exception as e:
-                    error_msg = f"❌ Error analyzing image: {str(e)}"
-                    chat_hist[-1] = (actual_question, error_msg, [])
-                    yield render_history(chat_hist), ""
-
-        # Trim history if too long
-        if len(chat_hist) > MAX_HISTORY_TURNS:
-            chat_hist = chat_hist[-MAX_HISTORY_TURNS:]
-
-        yield render_history(chat_hist), ""
-
-    def generate_lesson_plan(topic, duration, instructions, chat_hist):
-        if not topic:
-            return chat_hist, "⚠️ Please enter a lesson topic"
-
-        # Show processing message
-        processing_msg = "<div class='typing-indicator'><div class='typing-dot'></div><div class='typing-dot'></div><div class='typing-dot'></div></div>"
-        chat_hist.append((f"Generate lesson plan for: {topic}", processing_msg, []))
-        yield render_history(chat_hist), ""
-
-        # Generate the plan
-        plan = ai_system.generate_lesson_plan(topic, duration, instructions)
-
-        # Format with proper headings
-        formatted_plan = f"""
-        <div class='lesson-plan'>
-            <div class='lesson-title'>📝 Lesson Plan: {topic} ({duration} periods)</div>
-            {plan}
-        </div>
+               include_visuals, num_imgs, topic, duration, additional):
         """
+        1. Use actual_message (depending on mode) instead of raw `message`.
+        2. Convert any non‐string Bot response (like VLMDecodedResults) to str().
+        3. Disable the input box during streaming, then re-enable it at the end.
+        """
+        updated_history = list(history)
 
-        # Update chat history with final plan
-        chat_hist[-1] = (
-            f"Generate lesson plan for: {topic}",
-            formatted_plan,
-            []
-        )
-        yield render_history(chat_hist), ""
+        # Determine which prompt to actually send
+        if student:
+            actual_message = student_q
+        elif image:
+            actual_message = image_q
+        elif lesson:
+            actual_message = f"Generate lesson plan for: {topic} ({duration} periods)"
+            if additional:
+                actual_message += f"\nAdditional: {additional}"
+        else:
+            actual_message = message
+
+        # Add a “typing” placeholder entry using actual_message
+        typing_html = "<div class='typing-indicator'><div class='typing-dot'></div><div class='typing-dot'></div><div class='typing-dot'></div></div>"
+        updated_history.append((actual_message, typing_html, []))
+
+        # First yield: clear & disable the input box while streaming
+        yield render_history(updated_history), gr.update(value="", interactive=False), updated_history
+
+        full_response = ""
+        images = []
+
+        try:
+            if chat:
+                # General chat mode → streaming
+                for chunk in ai_system.generate_text_stream(actual_message, tokens):
+                    full_response = chunk
+                    updated_history[-1] = (actual_message, full_response, [])
+                    yield render_history(updated_history), gr.update(value="", interactive=False), updated_history
+
+                if include_visuals:
+                    images = ai_system.fetch_images(actual_message, num_imgs)
+
+            elif student:
+                # Student analytics mode → streaming
+                if ai_system.current_df is None:
+                    full_response = "⚠️ Please upload a student data file first"
+                else:
+                    for chunk in ai_system.analyze_student_data(student_q, tokens):
+                        full_response = chunk
+                        updated_history[-1] = (actual_message, full_response, [])
+                        yield render_history(updated_history), gr.update(value="", interactive=False), updated_history
+
+            elif image:
+                # Image analysis mode → synchronous
+                if (not image_upload) and (not image_url):
+                    full_response = "⚠️ Please upload an image or enter a URL"
+                else:
+                    # ai_system.analyze_image(...) returns a VLMDecodedResults, not a string
+                    result_obj = ai_system.analyze_image(image_upload, image_url, image_q)
+                    full_response = str(result_obj)
+
+            elif lesson:
+                # Lesson planning mode → streaming
+                if not topic:
+                    full_response = "⚠️ Please enter a lesson topic"
+                else:
+                    duration = int(duration) if duration else 5
+                    for chunk in ai_system.generate_lesson_plan(topic, duration, additional, tokens):
+                        full_response = chunk
+                        updated_history[-1] = (actual_message, full_response, [])
+                        yield render_history(updated_history), gr.update(value="", interactive=False), updated_history
+
+            # Final update: put in images (if any), trim history, and re-enable input
+            updated_history[-1] = (actual_message, full_response, images)
+            if len(updated_history) > MAX_HISTORY_TURNS:
+                updated_history = updated_history[-MAX_HISTORY_TURNS:]
+
+        except Exception as e:
+            error_msg = f"❌ Error: {str(e)}"
+            updated_history[-1] = (actual_message, error_msg, [])
+
+        # Final yield: clear & re-enable the input box
+        yield render_history(updated_history), gr.update(value="", interactive=True), updated_history
+
+    # Voice transcription
+    def transcribe_audio(audio):
+        return ai_system.transcribe(audio)
 
     # Mode toggles
     chat_mode.change(fn=toggle_modes, inputs=[chat_mode, student_mode, image_mode, lesson_mode],
@@ -851,10 +858,6 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
     # Document upload handler
     doc_upload.change(fn=process_document, inputs=doc_upload, outputs=doc_status)
 
-    # Voice transcription
-    def transcribe_audio(audio):
-        return ai_system.transcribe(audio)
-
     mic_btn.click(fn=transcribe_audio, inputs=mic, outputs=user_input)
 
     # Submit handler
@@ -863,16 +866,31 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         inputs=[
             user_input, chat_state, chat_mode, student_mode, image_mode, lesson_mode,
             max_tokens, student_question, image_question, image_upload, image_url,
-            include_images, num_images
+            include_images, num_images,
+            topic_input, duration_input, additional_instructions
         ],
-        outputs=[chatbot, user_input]
+        outputs=[chatbot, user_input, chat_state]
     )
 
     # Lesson plan generation button
     generate_btn.click(
-        fn=generate_lesson_plan,
-        inputs=[topic_input, duration_input, additional_instructions, chat_state],
-        outputs=[chatbot, topic_input]
+        fn=respond,
+        inputs=[
+            gr.Textbox(value="Generate lesson plan", visible=False),  # Hidden message
+            chat_state,
+            chat_mode, student_mode, image_mode, lesson_mode,
+            max_tokens,
+            gr.Textbox(visible=False),  # student_q
+            gr.Textbox(visible=False),  # image_q
+            gr.Image(visible=False),    # image_upload
+            gr.Textbox(visible=False),  # image_url
+            gr.Checkbox(visible=False), # include_visuals
+            gr.Slider(visible=False),   # num_imgs
+            topic_input,                # Pass topic
+            duration_input,             # Pass duration
+            additional_instructions     # Pass additional instructions
+        ],
+        outputs=[chatbot, user_input, chat_state]
     )
 
 if __name__ == "__main__":
