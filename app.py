@@ -21,13 +21,13 @@ from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor
 from typing import Generator
 
-# Google API configuration
+
 GOOGLE_API_KEY = "AIzaSyAo-1iW5MEZbc53DlEldtnUnDaYuTHUDH4"
 GOOGLE_CSE_ID = "3027bedf3c88a4efb"
-DEFAULT_MAX_TOKENS = 100
+DEFAULT_MAX_TOKENS = 4096
 DEFAULT_NUM_IMAGES = 1
 MAX_HISTORY_TURNS = 3
-MAX_TOKENS_LIMIT = 1000
+MAX_TOKENS_LIMIT = 4096
 
 class UnifiedAISystem:
     def __init__(self):
@@ -42,7 +42,7 @@ class UnifiedAISystem:
 
     def initialize_models(self):
         """Initialize all required models"""
-        # Download models if not exists
+        
         if not os.path.exists("mistral-ov"):
             snapshot_download(repo_id="OpenVINO/mistral-7b-instruct-v0.1-int8-ov", local_dir="mistral-ov")
         if not os.path.exists("internvl-ov"):
@@ -50,7 +50,6 @@ class UnifiedAISystem:
         if not os.path.exists("whisper-ov-model"):
             snapshot_download(repo_id="OpenVINO/whisper-tiny-fp16-ov", local_dir="whisper-ov-model")
 
-        # CPU-specific configuration
         cpu_features = cpuinfo.get_cpu_info()['flags']
         config_options = {}
         if 'avx512' in cpu_features:
@@ -65,7 +64,7 @@ class UnifiedAISystem:
             config={"PERFORMANCE_HINT": "THROUGHPUT", **config_options}
         )
 
-        # Initialize Whisper for audio processing
+    
         self.whisper_pipe = openvino_genai.WhisperPipeline("whisper-ov-model", device="CPU")
 
     def load_data(self, file_path):
@@ -103,8 +102,8 @@ class UnifiedAISystem:
                 return False, "❌ Unsupported document format. Please upload PDF or DOCX."
 
             # Clean and format text
-            text = text.replace('\x0c', '')  # Remove form feed characters
-            text = textwrap.dedent(text)      # Remove common leading whitespace
+            text = text.replace('\x0c', '')  
+            text = textwrap.dedent(text)      
             self.current_document_text = text
             return True, f"✅ Extracted text from {os.path.basename(file_path)}"
 
@@ -116,17 +115,17 @@ class UnifiedAISystem:
         start_time = time.time()
         response_queue = Queue()
         completion_event = Event()
-        error = [None]  # Use list to capture exception from thread
+        error = [None]  
 
         optimized_config = openvino_genai.GenerationConfig(
             max_new_tokens=max_tokens,
             temperature=0.3,
             top_p=0.9,
             streaming=True,
-            streaming_interval=5  # Batch tokens in groups of 5
+            streaming_interval=5  
         )
 
-        def callback(tokens):  # Accepts multiple tokens
+        def callback(tokens): 
             response_queue.put("".join(tokens))
             return openvino_genai.StreamingStatus.RUNNING
 
@@ -139,7 +138,7 @@ class UnifiedAISystem:
             finally:
                 completion_event.set()
 
-        # Submit generation task to executor
+       
         self.generation_executor.submit(generate)
 
         accumulated = []
@@ -158,7 +157,7 @@ class UnifiedAISystem:
                 token_count += len(token_batch)
                 yield "".join(accumulated)
 
-                # Periodic garbage collection
+              
                 if time.time() - last_gc > 2.0:
                     gc.collect()
                     last_gc = time.time()
@@ -182,18 +181,15 @@ class UnifiedAISystem:
         data_summary = self._prepare_data_summary(self.current_df)
         prompt = f"""You are an expert education analyst. Analyze the following student performance data:
         {data_summary}
-
         Question: {query}
-
         Please include:
         1. Direct answer to the question
         2. Relevant statistics
         3. Key insights
         4. Actionable recommendations
-
         Format the output with clear headings"""
+
         
-        # Use unified streaming generator
         yield from self.generate_text_stream(prompt, max_tokens)
 
     def _prepare_data_summary(self, df):
@@ -214,13 +210,13 @@ class UnifiedAISystem:
             else:
                 return "⚠️ Please upload an image or enter a valid URL"
 
-            # Convert to OpenVINO tensor
+            
             image_data = np.array(image_source.getdata()).reshape(
                 1, image_source.size[1], image_source.size[0], 3
             ).astype(np.byte)
             image_tensor = ov.Tensor(image_data)
 
-            # Lazy initialize InternVL
+            
             if self.internvl_pipe is None:
                 self.internvl_pipe = openvino_genai.VLMPipeline("internvl-ov", device="CPU")
 
@@ -229,7 +225,7 @@ class UnifiedAISystem:
                 output = self.internvl_pipe.generate(prompt, image=image_tensor, max_new_tokens=100)
                 self.internvl_pipe.finish_chat()
 
-            # output is a VLMDecodedResults; rest of the code expects a string
+           
             return output
 
         except Exception as e:
@@ -238,13 +234,13 @@ class UnifiedAISystem:
     def process_audio(self, data, sr):
         """Process audio data for speech recognition"""
         try:
-            # Convert to mono
+            
             if data.ndim > 1:
-                data = np.mean(data, axis=1)  # Simple mono conversion
+                data = np.mean(data, axis=1)  
             else:
                 data = data
 
-            # Convert to float32 and normalize
+           
             data = data.astype(np.float32)
             max_val = np.max(np.abs(data)) + 1e-7
             data /= max_val
@@ -254,7 +250,7 @@ class UnifiedAISystem:
 
             # Trim silence
             energy = np.abs(data)
-            threshold = np.percentile(energy, 25)  # Simple threshold
+            threshold = np.percentile(energy, 25)  
             mask = energy > threshold
             indices = np.where(mask)[0]
 
@@ -263,11 +259,11 @@ class UnifiedAISystem:
                 end = min(len(data), indices[-1] + 1000)
                 data = data[start:end]
 
-            # Resample if needed using simpler method
+          
             if sr != 16000:
-                # Calculate new length
+                
                 new_length = int(len(data) * 16000 / sr)
-                # Linear interpolation for resampling
+              
                 data = np.interp(
                     np.linspace(0, len(data)-1, new_length),
                     np.arange(len(data)),
@@ -286,18 +282,18 @@ class UnifiedAISystem:
             return ""
         sr, data = audio
 
-        # Skip if audio is too short (less than 0.5 seconds)
+      
         if len(data)/sr < 0.5:
             return ""
 
         try:
             processed = self.process_audio(data, sr)
 
-            # Skip if audio is still too short after processing
-            if len(processed) < 8000:  # 0.5 seconds at 16kHz
+            
+            if len(processed) < 8000:  
                 return ""
 
-            # Use OpenVINO Whisper pipeline
+          
             result = self.whisper_pipe.generate(processed)
             return result
         except Exception as e:
@@ -309,41 +305,36 @@ class UnifiedAISystem:
         if not topic:
             yield "⚠️ Please enter a lesson topic"
             return
-            
+
         if not self.current_document_text:
             yield "⚠️ Please upload and process a document first"
             return
 
         prompt = f"""As an expert educator, create a focused lesson plan using the provided content.
-
         **Core Requirements:**
         1. TOPIC: {topic}
         2. TOTAL DURATION: {duration} periods
         3. ADDITIONAL INSTRUCTIONS: {additional_instructions or 'None'}
-
         **Content Summary:**
         {self.current_document_text[:2500]}... [truncated]
-
         **Output Structure:**
         1. PERIOD ALLOCATION (Break topic into {duration} logical segments):
           - Period 1: [Subtopic 1]
           - Period 2: [Subtopic 2]
              ...
-
         2. LEARNING OBJECTIVES (Max 3 bullet points)
         3. TEACHING ACTIVITIES (One engaging method per period)
         4. RESOURCES (Key materials from document)
         5. ASSESSMENT (Simple checks for understanding)
         6. PAGE REFERENCES (Specific source pages)
-
 **Key Rules:**
 - Strictly divide content into exactly {duration} periods
 - Prioritize document content over creativity
 - Keep objectives measurable
 - Use only document resources
 - Make page references specific"""
-        
-        # Use unified streaming generator
+
+     
         yield from self.generate_text_stream(prompt, max_tokens)
 
     def fetch_images(self, query: str, num: int = DEFAULT_NUM_IMAGES) -> list:
@@ -354,9 +345,9 @@ class UnifiedAISystem:
         try:
             service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
             image_links = []
-            seen_urls = set()  # To track unique URLs
+            seen_urls = set()  
 
-            # Start from different positions to get unique images
+            
             for start_index in range(1, num * 2, 2):
                 if len(image_links) >= num:
                     break
@@ -381,207 +372,64 @@ class UnifiedAISystem:
             print(f"Error in image fetching: {e}")
             return []
 
-# Initialize global object
+
 ai_system = UnifiedAISystem()
 
-# CSS styles with improved output box
+
 css = """
-    .gradio-container {
-        background-color: #121212;
-        color: #fff;
-    }
-    .user-msg, .bot-msg {
-        padding: 12px 16px;
-        border-radius: 18px;
-        margin: 8px 0;
-        line-height: 1.5;
-        border: none;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .user-msg {
-        background: linear-gradient(135deg, #4a5568, #2d3748);
-        color: white;
-        margin-left: 20%;
-        border-bottom-right-radius: 5px;
-        border: none;
-    }
-    .bot-msg {
-        background: linear-gradient(135deg, #2d3748, #1a202c);
-        color: white;
-        margin-right: 20%;
-        border-bottom-left-radius: 5px;
-        border: none;
-    }
-    /* Remove top border from chat messages */
-    .user-msg, .bot-msg {
-        border-top: none !important;
-    }
-    /* Remove borders from chat container */
-    .chatbot > div {
-        border: none !important;
-    }
-    .chatbot .message {
-        border: none !important;
-    }
-    /* Improve scrollbar */
-    .chatbot::-webkit-scrollbar {
-        width: 8px;
-    }
-    .chatbot::-webkit-scrollbar-track {
-        background: #2a2a2a;
-        border-radius: 4px;
-    }
-    .chatbot::-webkit-scrollbar-thumb {
-        background: #4a5568;
-        border-radius: 4px;
-    }
-    .chatbot::-webkit-scrollbar-thumb:hover {
-        background: #5a6578;
-    }
-    /* Rest of the CSS remains the same */
-    .gradio-container {
-        background-color: #121212;
-        color: #fff;
-    }
-    .upload-box {
-        background-color: #333;
-        border-radius: 8px;
-        padding: 16px;
-        margin-bottom: 16px;
-    }
-    #question-input {
-        background-color: #333;
-        color: #fff;
-        border-radius: 8px;
-        padding: 12px;
-        border: 1px solid #555;
-    }
-    .mode-checkbox {
-        background-color: #333;
-        color: #fff;
-        border: 1px solid #555;
-        border-radius: 8px;
-        padding: 10px;
-        margin: 5px;
-    }
-    .slider-container {
-        margin-top: 20px;
-        padding: 15px;
-        border-radius: 10px;
-        background-color: #2a2a2a;
-    }
-    .system-info {
-        background-color: #7B9BDB;
-        padding: 15px;
-        border-radius: 8px;
-        margin: 15px 0;
-        border-left: 4px solid #1890ff;
-    }
-    .chat-image {
-        cursor: pointer;
-        transition: transform 0.2s;
-        max-height: 100px;
-        margin: 4px;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .chat-image:hover {
-        transform: scale(1.05);
-        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
-    }
-    .modal {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 100%;
-        background: rgba(0,0,0,0.8);
-        display: none;
-        z-index: 1000;
-        cursor: zoom-out;
-    }
-    .modal-content {
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        max-width: 90%;
-        max-height: 90%;
-        background: white;
-        padding: 10px;
-        border-radius: 12px;
-    }
-    .modal-img {
-        width: auto;
-        height: auto;
-        max-width: 100%;
-        max-height: 100%;
-        border-radius: 8px;
-    }
-    .typing-indicator {
-        display: inline-block;
-        position: relative;
-        width: 40px;
-        height: 20px;
-    }
-    .typing-dot {
-        display: inline-block;
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background-color: #fff;
-        position: absolute;
-        animation: typing 1.4s infinite ease-in-out;
-    }
-    .typing-dot:nth-child(1) {
-        left: 0;
-        animation-delay: 0s;
-    }
-    .typing-dot:nth-child(2) {
-        left: 12px;
-        animation-delay: 0.2s;
-    }
-    .typing-dot:nth-child(3) {
-        left: 24px;
-        animation-delay: 0.4s;
-    }
-    @keyframes typing {
-        0%, 60%, 100% { transform: translateY(0); }
-        30% { transform: translateY(-5px); }
-    }
-    .lesson-plan {
-        background: linear-gradient(135deg, #1a202c, #2d3748);
-        padding: 15px;
-        border-radius: 12px;
-        margin: 10px 0;
-        border-left: 4px solid #4a9df0;
-    }
-    .lesson-section {
-        margin-bottom: 15px;
-        padding-bottom: 10px;
-        border-bottom: 1px solid #4a5568;
-    }
-    .lesson-title {
-        font-size: 1.2em;
-        font-weight: bold;
-        color: #4a9df0;
-        margin-bottom: 8px;
-    }
-    .page-ref {
-        background-color: #4a5568;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 0.9em;
-        display: inline-block;
-        margin: 3px;
-    }
+    :root {
+  --bg: #0D0D0D;
+  --surface: #1F1F1F;
+  --primary: #BB86FC;
+  --secondary: #03DAC6;
+  --accent: #CF6679;
+  --success: #4CAF50;
+  --warning: #FFB300;
+  --text: #FFFFFF;
+  --subtext: #B0B0B0;
+  --divider: #333333;
+}
+body, .gradio-container { background: var(--bg); color: var(--text); }
+.user-msg,
+.bot-msg,
+.upload-box,
+#question-input,
+.mode-checkbox,
+.system-info,
+.lesson-plan { background: var(--surface); border-radius: 8px; color: var(--text); }
+.user-msg,
+.bot-msg { padding: 12px 16px; margin: 8px 0; line-height:1.5; border-left:4px solid var(--primary); box-shadow:0 2px 6px rgba(0,0,0,0.5); }
+.bot-msg { border-color: var(--secondary); }
+.upload-box { padding:16px; margin-bottom:16px; border:1px solid var(--divider); }
+#question-input,
+.mode-checkbox { padding:12px; border:1px solid var(--divider); }
+.slider-container { margin:20px 0; padding:15px; border-radius:10px; background:var(--secondary); }
+.system-info { padding:15px; margin:15px 0; border-left:4px solid var(--primary); }
+.chat-image { max-height:100px; margin:4px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.5); cursor:pointer; transition:transform .2s; }
+.chat-image:hover { transform:scale(1.05); box-shadow:0 4px 10px rgba(0,0,0,0.7); }
+.modal { position:fixed; inset:0; background:rgba(0,0,0,0.9); display:none; cursor:zoom-out; }
+.modal-content { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); max-width:90%; max-height:90%; padding:10px; border-radius:12px; background:var(--surface); }
+.modal-img { max-width:100%; max-height:100%; border-radius:8px; }
+.typing-indicator { display:inline-block; position:relative; width:40px; height:20px; }
+.typing-dot { width:6px; height:6px; border-radius:50%; background:var(--text); position:absolute; animation:typing 1.4s infinite ease-in-out; }
+.typing-dot:nth-child(1){left:0;}
+.typing-dot:nth-child(2){left:12px;animation-delay:.2s}
+.typing-dot:nth-child(3){left:24px;animation-delay:.4s}
+@keyframes typing{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+.lesson-title { font-size:1.2em; font-weight:bold; color:var(--primary); margin-bottom:8px; }
+.page-ref { display:inline-block; padding:3px 8px; margin:3px; border-radius:4px; background:var(--primary); color:var(--text); font-size:.9em; }
+/* Scrollbar */
+.chatbot::-webkit-scrollbar{width:8px}
+.chatbot::-webkit-scrollbar-track{background:var(--surface);border-radius:4px}
+.chatbot::-webkit-scrollbar-thumb{background:var(--primary);border-radius:4px}
+.chatbot::-webkit-scrollbar-thumb:hover{background:var(--secondary)}
 """
 
-# Create Gradio interface
+
 with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
     gr.Markdown("# 🤖 Unified EDU Assistant by Phanindra Reddy K")
 
-    # System info banner
+   
     gr.HTML("""
     <div class="system-info">
         <strong>Multi-Modal AI Assistant</strong>
@@ -595,7 +443,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
     </div>
     """)
 
-    # Modal for image preview
+    
     modal_html = """
     <div class="modal" id="imageModal" onclick="this.style.display='none'">
         <div class="modal-content">
@@ -616,14 +464,14 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         chatbot = gr.Chatbot(label="Conversation", height=500, bubble_full_width=False,
                             avatar_images=("user.png", "bot.png"), show_label=False)
 
-    # Mode selection
+  
     with gr.Row():
         chat_mode = gr.Checkbox(label="💬 General Chat", value=True, elem_classes="mode-checkbox")
         student_mode = gr.Checkbox(label="🎓 Student Analytics", value=False, elem_classes="mode-checkbox")
         image_mode = gr.Checkbox(label="🖼️ Image Analysis", value=False, elem_classes="mode-checkbox")
         lesson_mode = gr.Checkbox(label="📝 Lesson Planning", value=False, elem_classes="mode-checkbox")
 
-    # Dynamic input fields (General Chat by default)
+    
     with gr.Column() as chat_inputs:
         include_images = gr.Checkbox(label="Include Visuals", value=True)
         user_input = gr.Textbox(
@@ -649,7 +497,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
                 visible=True
             )
 
-    # Student inputs
+
     with gr.Column(visible=False) as student_inputs:
         file_upload = gr.File(label="CSV/Excel File", file_types=[".csv", ".xlsx"], type="filepath")
         student_question = gr.Textbox(
@@ -659,7 +507,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         )
         student_status = gr.Markdown("No file loaded")
 
-    # Image analysis inputs
+  
     with gr.Column(visible=False) as image_inputs:
         image_upload = gr.Image(type="pil", label="Upload Image")
         image_url = gr.Textbox(
@@ -673,7 +521,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
             elem_id="question-input"
         )
 
-    # Lesson planning inputs
+
     with gr.Column(visible=False) as lesson_inputs:
         gr.Markdown("### 📚 Lesson Planning")
         doc_upload = gr.File(
@@ -703,13 +551,13 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
 
         generate_btn = gr.Button("Generate Lesson Plan", variant="primary")
 
-    # Common controls
+
     with gr.Row():
         submit_btn = gr.Button("Send", variant="primary")
         mic_btn = gr.Button("Transcribe Voice", variant="secondary")
         mic = gr.Audio(sources=["microphone"], type="numpy", label="Voice Input")
 
-    # Event handlers
+  
     def toggle_modes(chat, student, image, lesson):
         return [
             gr.update(visible=chat),
@@ -734,7 +582,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         for user_msg, bot_msg, image_links in history:
             user_html = f"<div class='user-msg'>{user_msg}</div>"
 
-            # Ensure bot_msg is a string before checking substrings
+           
             bot_text = str(bot_msg)
 
             if "Lesson Plan:" in bot_text:
@@ -763,7 +611,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         """
         updated_history = list(history)
 
-        # Determine which prompt to actually send
+       
         if student:
             actual_message = student_q
         elif image:
@@ -775,11 +623,10 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         else:
             actual_message = message
 
-        # Add a “typing” placeholder entry using actual_message
+       
         typing_html = "<div class='typing-indicator'><div class='typing-dot'></div><div class='typing-dot'></div><div class='typing-dot'></div></div>"
         updated_history.append((actual_message, typing_html, []))
 
-        # First yield: clear & disable the input box while streaming
         yield render_history(updated_history), gr.update(value="", interactive=False), updated_history
 
         full_response = ""
@@ -787,7 +634,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
 
         try:
             if chat:
-                # General chat mode → streaming
+                
                 for chunk in ai_system.generate_text_stream(actual_message, tokens):
                     full_response = chunk
                     updated_history[-1] = (actual_message, full_response, [])
@@ -797,7 +644,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
                     images = ai_system.fetch_images(actual_message, num_imgs)
 
             elif student:
-                # Student analytics mode → streaming
+               
                 if ai_system.current_df is None:
                     full_response = "⚠️ Please upload a student data file first"
                 else:
@@ -807,16 +654,16 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
                         yield render_history(updated_history), gr.update(value="", interactive=False), updated_history
 
             elif image:
-                # Image analysis mode → synchronous
+               
                 if (not image_upload) and (not image_url):
                     full_response = "⚠️ Please upload an image or enter a URL"
                 else:
-                    # ai_system.analyze_image(...) returns a VLMDecodedResults, not a string
+                    
                     result_obj = ai_system.analyze_image(image_upload, image_url, image_q)
                     full_response = str(result_obj)
 
             elif lesson:
-                # Lesson planning mode → streaming
+               
                 if not topic:
                     full_response = "⚠️ Please enter a lesson topic"
                 else:
@@ -826,7 +673,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
                         updated_history[-1] = (actual_message, full_response, [])
                         yield render_history(updated_history), gr.update(value="", interactive=False), updated_history
 
-            # Final update: put in images (if any), trim history, and re-enable input
+           
             updated_history[-1] = (actual_message, full_response, images)
             if len(updated_history) > MAX_HISTORY_TURNS:
                 updated_history = updated_history[-MAX_HISTORY_TURNS:]
@@ -835,14 +682,14 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
             error_msg = f"❌ Error: {str(e)}"
             updated_history[-1] = (actual_message, error_msg, [])
 
-        # Final yield: clear & re-enable the input box
+        
         yield render_history(updated_history), gr.update(value="", interactive=True), updated_history
 
     # Voice transcription
     def transcribe_audio(audio):
         return ai_system.transcribe(audio)
 
-    # Mode toggles
+   
     chat_mode.change(fn=toggle_modes, inputs=[chat_mode, student_mode, image_mode, lesson_mode],
                    outputs=[chat_inputs, student_inputs, image_inputs, lesson_inputs])
     student_mode.change(fn=toggle_modes, inputs=[chat_mode, student_mode, image_mode, lesson_mode],
@@ -872,26 +719,27 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
         outputs=[chatbot, user_input, chat_state]
     )
 
-    # Lesson plan generation button
+   
     generate_btn.click(
         fn=respond,
         inputs=[
-            gr.Textbox(value="Generate lesson plan", visible=False),  # Hidden message
+            gr.Textbox(value="Generate lesson plan", visible=False),  
             chat_state,
             chat_mode, student_mode, image_mode, lesson_mode,
             max_tokens,
-            gr.Textbox(visible=False),  # student_q
-            gr.Textbox(visible=False),  # image_q
-            gr.Image(visible=False),    # image_upload
-            gr.Textbox(visible=False),  # image_url
-            gr.Checkbox(visible=False), # include_visuals
-            gr.Slider(visible=False),   # num_imgs
-            topic_input,                # Pass topic
-            duration_input,             # Pass duration
-            additional_instructions     # Pass additional instructions
+            gr.Textbox(visible=False),  
+            gr.Textbox(visible=False), 
+            gr.Image(visible=False),    
+            gr.Textbox(visible=False), 
+            gr.Checkbox(visible=False), 
+            gr.Slider(visible=False),   
+            topic_input,                
+            duration_input,             
+            additional_instructions     
         ],
         outputs=[chatbot, user_input, chat_state]
     )
 
 if __name__ == "__main__":
     demo.launch(share=True, debug=True)
+
