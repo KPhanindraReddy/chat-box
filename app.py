@@ -443,7 +443,7 @@ with gr.Blocks(css=css, title="Unified EDU Assistant") as demo:
     </div>
     """)
 
-    
+     
     modal_html = """
     <div class="modal" id="imageModal" onclick="this.style.display='none'">
         <div class="modal-content">
